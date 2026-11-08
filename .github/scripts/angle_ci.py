@@ -87,11 +87,17 @@ PLATFORM_GN_ARGS = {
         "angle_use_vulkan_display": False,
         "angle_use_wayland": False,
         "angle_use_x11": True,
+        # SwiftShader only compiles its X11 (XCB) window surface when
+        # ozone_platform_x11 is set, and GN requires use_ozone for that.
+        # Without it SwiftShader can only render offscreen, so an X11 app
+        # (GLFW on Swaylib, for one) cannot use ANGLE's software renderer.
+        "ozone_auto_platforms": False,
+        "ozone_platform": "x11",
         "ozone_platform_drm": False,
         "ozone_platform_headless": False,
         "ozone_platform_wayland": False,
-        "ozone_platform_x11": False,
-        "use_ozone": False,
+        "ozone_platform_x11": True,
+        "use_ozone": True,
     },
     "darwin": {
         "target_os": "mac",
@@ -131,6 +137,9 @@ SMOKE_SOURCE = r"""
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__linux__)
+#include <X11/Xlib.h>
+#endif
 
 static void fail(const char *message)
 {
@@ -211,6 +220,95 @@ static EGLDisplay getSwiftShaderDisplay()
                                     reinterpret_cast<void *>(EGL_DEFAULT_DISPLAY), attribs);
 }
 
+#if defined(__linux__)
+// Draws to a real X11 window through ANGLE's Vulkan backend on SwiftShader,
+// which only works when SwiftShader was built with its XCB surface.
+static int runSwiftShaderX11Smoke()
+{
+    Display *xdisplay = XOpenDisplay(nullptr);
+    if (xdisplay == nullptr)
+    {
+        fail("XOpenDisplay failed");
+    }
+    Window window = XCreateSimpleWindow(xdisplay, DefaultRootWindow(xdisplay), 0, 0, 16, 16, 0,
+                                        0, 0);
+    XMapWindow(xdisplay, window);
+    XSync(xdisplay, False);
+
+    const EGLint displayAttribs[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_SWIFTSHADER_ANGLE,
+        EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, EGL_PLATFORM_X11_EXT,
+        EGL_NONE,
+    };
+    EGLDisplay display =
+        eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, xdisplay, displayAttribs);
+    EGLint major = 0;
+    EGLint minor = 0;
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
+    {
+        fail("SwiftShader X11 eglInitialize failed");
+    }
+
+    const EGLint configAttribs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_NONE,
+    };
+    EGLConfig config = nullptr;
+    EGLint configCount = 0;
+    if (!eglChooseConfig(display, configAttribs, &config, 1, &configCount) || configCount < 1)
+    {
+        fail("SwiftShader X11 eglChooseConfig failed");
+    }
+    EGLSurface surface =
+        eglCreateWindowSurface(display, config, (EGLNativeWindowType)window, nullptr);
+    if (surface == EGL_NO_SURFACE)
+    {
+        fail("SwiftShader X11 eglCreateWindowSurface failed");
+    }
+    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
+    if (context == EGL_NO_CONTEXT || !eglMakeCurrent(display, surface, surface, context))
+    {
+        fail("SwiftShader X11 context creation failed");
+    }
+
+    const char *renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
+    std::printf("GL_RENDERER=%s\n", renderer ? renderer : "unknown");
+    if (!renderer || !std::strstr(renderer, "SwiftShader"))
+    {
+        fail("X11 window smoke did not select SwiftShader");
+    }
+
+    glViewport(0, 0, 16, 16);
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    unsigned char pixel[4] = {};
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    if (glGetError() != GL_NO_ERROR || pixel[0] != 0 || pixel[1] != 255 || pixel[2] != 0)
+    {
+        fail("SwiftShader X11 clear/readback pixel mismatch");
+    }
+    if (!eglSwapBuffers(display, surface))
+    {
+        fail("SwiftShader X11 eglSwapBuffers failed");
+    }
+
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(display, surface);
+    eglDestroyContext(display, context);
+    eglTerminate(display);
+    XDestroyWindow(xdisplay, window);
+    XCloseDisplay(xdisplay);
+    std::printf("SwiftShader X11 window surface passed\n");
+    return 0;
+}
+#endif
+
 static EGLDisplay getAnglePlatformDisplay()
 {
 #if defined(_WIN32)
@@ -240,6 +338,12 @@ static EGLDisplay getAnglePlatformDisplay()
 
 int main()
 {
+#if defined(__linux__)
+    if (std::getenv("ANGLE_SMOKE_SWIFTSHADER_X11") != nullptr)
+    {
+        return runSwiftShaderX11Smoke();
+    }
+#endif
     const bool software = std::getenv("ANGLE_SMOKE_SWIFTSHADER") != nullptr;
     EGLDisplay display = software ? getSwiftShaderDisplay() : eglGetDisplay(EGL_DEFAULT_DISPLAY);
 
@@ -1304,6 +1408,8 @@ def check_dependencies(extract_root, target_platform, source_root=None, arch=Non
                 output = run_output(["readelf", "-d", str(lib)])
             if "not found" in output:
                 raise RuntimeError(f"Missing dynamic dependency for {lib}")
+        if software:
+            check_swiftshader_x11(out_dir / swiftshader_library(target_platform))
     elif target_platform == "darwin":
         for name in libraries:
             run(["otool", "-L", str(out_dir / name)])
@@ -1316,6 +1422,14 @@ def check_dependencies(extract_root, target_platform, source_root=None, arch=Non
                 print(f"  {imported}")
             if not imports:
                 raise RuntimeError(f"Could not read dynamic imports from {lib}")
+
+
+def check_swiftshader_x11(path):
+    # The extension name is in SwiftShader's extension table only when its XCB
+    # surface was compiled in, so this catches a build that lost ozone_platform_x11.
+    if b"VK_KHR_xcb_surface\0" not in Path(path).read_bytes():
+        raise RuntimeError(f"{path} was built without SwiftShader's X11 window surface")
+    print(f"{Path(path).name} has the X11 window surface")
 
 
 def read_pe_imports(path):
@@ -1417,6 +1531,7 @@ def compile_and_run_smoke(extract_root, target_platform, arch):
     ]
     if target_platform == "linux":
         cmd.insert(-2, "-Wl,-rpath,$ORIGIN/angle/out/Release")
+        cmd.insert(-2, "-lX11")
     elif target_platform == "darwin":
         cmd.insert(-2, f"-Wl,-rpath,{lib_dir}")
 
@@ -1442,6 +1557,16 @@ def compile_and_run_smoke(extract_root, target_platform, arch):
         env.pop("DISPLAY", None)
         env.pop("WAYLAND_DISPLAY", None)
         run([str(exe)], env=env)
+        if target_platform == "linux":
+            env.pop("ANGLE_SMOKE_SWIFTSHADER")
+            env["ANGLE_SMOKE_SWIFTSHADER_X11"] = "1"
+            if shutil.which("xvfb-run"):
+                run(["xvfb-run", "-a", str(exe)], env=env)
+            elif os.environ.get("DISPLAY"):
+                env["DISPLAY"] = os.environ["DISPLAY"]
+                run([str(exe)], env=env)
+            else:
+                raise RuntimeError("The SwiftShader X11 smoke needs xvfb-run or DISPLAY")
 
 
 def prepend_env_path(current, value):
@@ -1657,12 +1782,16 @@ def release_notes(args):
         "Assets:",
     ]
     lines.extend(f"- {name}" for name in archives)
+    if (artifact_root / "SHA256SUMS").is_file():
+        lines.append("- SHA256SUMS")
     lines.extend(
         [
             "",
             "Each archive contains angle/include, angle/out/Release, LICENSE, and angle-build.json.",
         ]
     )
+    if (artifact_root / "SHA256SUMS").is_file():
+        lines.append("Check a download with `sha256sum --check --ignore-missing SHA256SUMS`.")
     Path(args.output).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

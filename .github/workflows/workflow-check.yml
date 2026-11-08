@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Validate CI helpers
         shell: bash
@@ -45,6 +47,11 @@ jobs:
                 --json-output "$tmp/$platform-$arch.args.json" >/dev/null
           done
           grep -Fxq 'use_siso = false' "$tmp/win32-x64.args.gn"
+          # SwiftShader's X11 window surface; consumers like Swaylib need it.
+          for arch in x64 arm64; do
+            grep -Fxq 'ozone_platform_x11 = true' "$tmp/linux-$arch.args.gn"
+            grep -Fxq 'use_ozone = true' "$tmp/linux-$arch.args.gn"
+          done
           if grep -Fq 'use_siso' "$tmp/win32-arm64.args.gn"; then
             echo "::error::Siso workaround must remain limited to Windows x64"
             exit 1

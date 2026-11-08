@@ -359,6 +359,13 @@ def make_release_notes(manifest, artifact_root):
             ]
         )
     body.extend(["", "Assets:", *(f"- `{name}`" for name in names), ""])
+    if "SHA256SUMS" in names:
+        body.extend(
+            [
+                "Check a download with `sha256sum --check --ignore-missing SHA256SUMS`.",
+                "",
+            ]
+        )
     body.extend(
         [
             "<details>",
