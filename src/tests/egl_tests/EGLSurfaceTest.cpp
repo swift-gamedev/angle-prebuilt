@@ -351,6 +351,7 @@ class EGLSurfaceTest : public ANGLETest<>
 
     void runWaitSemaphoreTest(bool useSecondContext);
     void runDestroyNotCurrentSurfaceTest(bool testWindowsSurface);
+    void runPreserveWithSwapIntervalTest(EGLint swapInterval);
 
     void drawQuadThenTearDown();
 
@@ -561,7 +562,17 @@ TEST_P(EGLFloatSurfaceTest, Drawing)
 }
 
 class EGLSurfaceTest3 : public EGLSurfaceTest
-{};
+{
+  protected:
+    void verifyBlitBetweenDifferentSizes(EGLint readWidth,
+                                         EGLint readHeight,
+                                         EGLint drawWidth,
+                                         EGLint drawHeight);
+    void verifyColorDepthStencilBlitBetweenDifferentSizes(EGLint readWidth,
+                                                          EGLint readHeight,
+                                                          EGLint drawWidth,
+                                                          EGLint drawHeight);
+};
 
 // Test a surface bug where we could have two Window surfaces active
 // at one time, blocking message loops. See http://crbug.com/475085
@@ -1165,10 +1176,6 @@ TEST_P(EGLSurfaceTest3, MakeCurrentDifferentSurfaces)
     // Use the same surface for both draw and read
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, firstPbufferSurface, firstPbufferSurface, mContext));
 
-    // TODO(http://anglebug.com/42264803): Failing with OpenGL ES backend on Android.
-    // Must be after the eglMakeCurrent() so the renderer string is initialized.
-    ANGLE_SKIP_TEST_IF(IsOpenGLES() && IsAndroid());
-
     glClearColor(kFloatRed.R, kFloatRed.G, kFloatRed.B, kFloatRed.A);
     glClear(GL_COLOR_BUFFER_BIT);
     ASSERT_GL_NO_ERROR();
@@ -1671,10 +1678,6 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfaces)
     // Clear surface1.
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, surface1, surface1, mContext));
 
-    // TODO(http://anglebug.com/42264803): Failing with OpenGL ES backend on Android and
-    // Windows. Must be after the eglMakeCurrent() so the renderer string is initialized.
-    ANGLE_SKIP_TEST_IF(IsOpenGLES() && (IsAndroid() || IsWindows()));
-
     glClearColor(kFloatRed.R, kFloatRed.G, kFloatRed.B, kFloatRed.A);
     glClear(GL_COLOR_BUFFER_BIT);
     ASSERT_GL_NO_ERROR();
@@ -1722,10 +1725,6 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfacesWithDeferredClear)
     // Clear surface1.
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, surface1, surface1, mContext));
 
-    // TODO(http://anglebug.com/42264803): Failing with OpenGL ES backend on Android and
-    // Windows. Must be after the eglMakeCurrent() so the renderer string is initialized.
-    ANGLE_SKIP_TEST_IF(IsOpenGLES() && (IsAndroid() || IsWindows()));
-
     glClearColor(kFloatRed.R, kFloatRed.G, kFloatRed.B, kFloatRed.A);
     glClear(GL_COLOR_BUFFER_BIT);
     ASSERT_GL_NO_ERROR();
@@ -1751,6 +1750,268 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfacesWithDeferredClear)
 
     eglDestroySurface(mDisplay, surface1);
     eglDestroySurface(mDisplay, surface2);
+}
+
+// Verify that blitting the entire read surface to the draw surface with different sizes uses the
+// read surface's dimensions as the source bounds and scales the result to fit the entire draw
+// surface.
+void EGLSurfaceTest3::verifyBlitBetweenDifferentSizes(EGLint readWidth,
+                                                      EGLint readHeight,
+                                                      EGLint drawWidth,
+                                                      EGLint drawHeight)
+{
+    initializeDisplay();
+    ASSERT_NE(mDisplay, EGL_NO_DISPLAY);
+
+    initializeSurfaceWithDefaultConfig(true);
+    initializeMainContext();
+    ASSERT_NE(mWindowSurface, EGL_NO_SURFACE);
+    ASSERT_NE(mContext, EGL_NO_CONTEXT);
+
+    const EGLint readSurfaceAttributes[] = {
+        EGL_WIDTH, readWidth, EGL_HEIGHT, readHeight, EGL_NONE,
+    };
+    const EGLint drawSurfaceAttributes[] = {
+        EGL_WIDTH, drawWidth, EGL_HEIGHT, drawHeight, EGL_NONE,
+    };
+
+    EGLSurface readSurface = eglCreatePbufferSurface(mDisplay, mConfig, readSurfaceAttributes);
+    ASSERT_EGL_SUCCESS();
+    EGLSurface drawSurface = eglCreatePbufferSurface(mDisplay, mConfig, drawSurfaceAttributes);
+    ASSERT_EGL_SUCCESS();
+
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, readSurface, readSurface, mContext));
+
+    // Use a checkerProgram on readSurface to verify stretching and flipping.
+    ANGLE_GL_PROGRAM(checkerProgram, essl1_shaders::vs::Passthrough(),
+                     essl1_shaders::fs::Checkered());
+    glViewport(0, 0, readWidth, readHeight);
+    drawQuad(checkerProgram, essl1_shaders::PositionAttrib(), 0.5f);
+    ASSERT_GL_NO_ERROR();
+
+    // Clear drawSurface to a color different from those output by the Checkered() shader to detect
+    // any areas not covered by the blit.
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, drawSurface, drawSurface, mContext));
+    glClearColor(kFloatBlack.R, kFloatBlack.G, kFloatBlack.B, kFloatBlack.A);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    // Blit the entire readSurface to the entire drawSurface.
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, drawSurface, readSurface, mContext));
+    glBlitFramebuffer(0, 0, readWidth, readHeight, 0, 0, drawWidth, drawHeight, GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
+    ASSERT_GL_NO_ERROR();
+
+    // Verify that the checker pattern is blitted and scaled to cover the entire drawSurface.
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, drawSurface, drawSurface, mContext));
+    const GLint halfWidth  = drawWidth / 2;
+    const GLint halfHeight = drawHeight / 2;
+    EXPECT_PIXEL_RECT_EQ(0, 0, halfWidth, halfHeight, GLColor::red);
+    EXPECT_PIXEL_RECT_EQ(halfWidth, 0, halfWidth, halfHeight, GLColor::blue);
+    EXPECT_PIXEL_RECT_EQ(0, halfHeight, halfWidth, halfHeight, GLColor::green);
+    EXPECT_PIXEL_RECT_EQ(halfWidth, halfHeight, halfWidth, halfHeight, GLColor::yellow);
+
+    eglDestroySurface(mDisplay, readSurface);
+    eglDestroySurface(mDisplay, drawSurface);
+}
+
+// Blit from a larger read surface to a smaller draw surface with a different aspect ratio.
+TEST_P(EGLSurfaceTest3, BlitFromLargerReadSurfaceToSmallerDrawSurface)
+{
+    // Read surface: 64x48 (4:3), Draw surface: 24x32 (3:4)
+    verifyBlitBetweenDifferentSizes(64, 48, 24, 32);
+}
+
+// Blit from a smaller read surface to a larger draw surface with a different aspect ratio.
+TEST_P(EGLSurfaceTest3, BlitFromSmallerReadSurfaceToLargerDrawSurface)
+{
+    // Read surface: 24x32 (3:4), Draw surface: 64x48 (4:3)
+    verifyBlitBetweenDifferentSizes(24, 32, 64, 48);
+}
+
+// Verify that blitting color and depth/stencil together between differently sized default read and
+// draw surfaces is limited to the area valid for both.  Color comes from the read surface, while
+// depth/stencil comes from the draw surface.
+void EGLSurfaceTest3::verifyColorDepthStencilBlitBetweenDifferentSizes(EGLint readWidth,
+                                                                       EGLint readHeight,
+                                                                       EGLint drawWidth,
+                                                                       EGLint drawHeight)
+{
+    initializeDisplay();
+    ASSERT_NE(mDisplay, EGL_NO_DISPLAY);
+
+    const EGLint configAttributes[] = {EGL_SURFACE_TYPE,
+                                       EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+                                       EGL_RED_SIZE,
+                                       8,
+                                       EGL_GREEN_SIZE,
+                                       8,
+                                       EGL_BLUE_SIZE,
+                                       8,
+                                       EGL_ALPHA_SIZE,
+                                       8,
+                                       EGL_DEPTH_SIZE,
+                                       24,
+                                       EGL_STENCIL_SIZE,
+                                       8,
+                                       EGL_SAMPLE_BUFFERS,
+                                       0,
+                                       EGL_NONE};
+    EGLConfig config;
+    ANGLE_SKIP_TEST_IF(EGLWindow::FindEGLConfig(mDisplay, configAttributes, &config) == EGL_FALSE);
+
+    initializeSurface(config);
+    initializeMainContext();
+    ASSERT_NE(mWindowSurface, EGL_NO_SURFACE);
+    ASSERT_NE(mContext, EGL_NO_CONTEXT);
+
+    const EGLint readSurfaceAttributes[] = {
+        EGL_WIDTH, readWidth, EGL_HEIGHT, readHeight, EGL_NONE,
+    };
+    const EGLint drawSurfaceAttributes[] = {
+        EGL_WIDTH, drawWidth, EGL_HEIGHT, drawHeight, EGL_NONE,
+    };
+
+    EGLSurface readSurface = eglCreatePbufferSurface(mDisplay, mConfig, readSurfaceAttributes);
+    ASSERT_EGL_SUCCESS();
+    EGLSurface drawSurface = eglCreatePbufferSurface(mDisplay, mConfig, drawSurfaceAttributes);
+    ASSERT_EGL_SUCCESS();
+
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, readSurface, readSurface, mContext));
+
+    // Use a checkerProgram to verify the blitted area.
+    ANGLE_GL_PROGRAM(checkerProgram, essl1_shaders::vs::Passthrough(),
+                     essl1_shaders::fs::Checkered());
+    glViewport(0, 0, readWidth, readHeight);
+    drawQuad(checkerProgram, essl1_shaders::PositionAttrib(), 0.5f);
+    ASSERT_GL_NO_ERROR();
+
+    constexpr GLfloat kDrawSurfaceDepth = 0.25f;
+    constexpr GLint kDrawSurfaceStencil = 0x55;
+
+    // Clear the depth/stencil of drawSurface.
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, drawSurface, drawSurface, mContext));
+    glClearDepthf(kDrawSurfaceDepth);
+    glClearStencil(kDrawSurfaceStencil);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    // Create renderbuffer.
+    GLRenderbuffer colorRenderbuffer;
+    glBindRenderbuffer(GL_RENDERBUFFER, colorRenderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, readWidth, readHeight);
+    GLRenderbuffer depthStencilRenderbuffer;
+    glBindRenderbuffer(GL_RENDERBUFFER, depthStencilRenderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, readWidth, readHeight);
+
+    // Create fbo.
+    GLFramebuffer framebuffer;
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                              colorRenderbuffer);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+                              depthStencilRenderbuffer);
+
+    ASSERT_GL_NO_ERROR();
+    ASSERT_GLENUM_EQ(GL_FRAMEBUFFER_COMPLETE, glCheckFramebufferStatus(GL_FRAMEBUFFER));
+
+    // Clear drawSurface to a color different from those output by the Checkered() shader to detect
+    // any areas not covered by the blit.
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, drawSurface, readSurface, mContext));
+    glClearColor(kFloatBlack.R, kFloatBlack.G, kFloatBlack.B, kFloatBlack.A);
+    glClearDepthf(1.0f);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    ASSERT_GL_NO_ERROR();
+
+    // Blit the entire default read framebuffer, including depth/stencil.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, readWidth, readHeight, 0, 0, readWidth, readHeight,
+                      GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
+                      GL_NEAREST);
+    ASSERT_GL_NO_ERROR();
+
+    // The size of the blit area
+    const GLint blitAreaWidth  = std::min(readWidth, drawWidth);
+    const GLint blitAreaHeight = std::min(readHeight, drawHeight);
+    // The width of the left checker column and the height of the bottom checker row within the blit
+    // area.
+    const GLint leftColumnWidth = std::min(readWidth / 2, blitAreaWidth);
+    const GLint bottomRowHeight = std::min(readHeight / 2, blitAreaHeight);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+    // Verify that only the checker pattern within the blit area is copied and that the area outside
+    // remains black.  The pattern on readSurface is divided at (readWidth / 2, readHeight / 2).
+    // With the origin at the bottom left, the expected result is shown below.
+    //
+    //                    y
+    //                    ^
+    // blitAreaHeight ->  +--------+--------+
+    //                    |        |        |
+    //                    | green  | yellow |
+    //                    |        |        |
+    // bottomRowHeight -> +--------+--------+
+    //                    |        |        |
+    //                    |  red   |  blue  |
+    //                    |        |        |
+    //                    +--------+--------+--> x
+    //                    0 leftColumnWidth blitAreaWidth
+    //
+    EXPECT_PIXEL_RECT_EQ(0, 0, leftColumnWidth, bottomRowHeight, GLColor::red);
+    EXPECT_PIXEL_RECT_EQ(leftColumnWidth, 0, blitAreaWidth - leftColumnWidth, bottomRowHeight,
+                         GLColor::blue);
+    EXPECT_PIXEL_RECT_EQ(0, bottomRowHeight, leftColumnWidth, blitAreaHeight - bottomRowHeight,
+                         GLColor::green);
+    EXPECT_PIXEL_RECT_EQ(leftColumnWidth, bottomRowHeight, blitAreaWidth - leftColumnWidth,
+                         blitAreaHeight - bottomRowHeight, GLColor::yellow);
+    EXPECT_PIXEL_RECT_EQ(blitAreaWidth, 0, readWidth - blitAreaWidth, readHeight, GLColor::black);
+    EXPECT_PIXEL_RECT_EQ(0, blitAreaHeight, blitAreaWidth, readHeight - blitAreaHeight,
+                         GLColor::black);
+
+    // Verify the blitted depth.  Draw with a depth that only passes against kDrawSurfaceDepth.
+    ANGLE_GL_PROGRAM(blueProgram, essl1_shaders::vs::Passthrough(), essl1_shaders::fs::Blue());
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_GREATER);
+    drawQuad(blueProgram, essl1_shaders::PositionAttrib(), 0.0f);
+    glDisable(GL_DEPTH_TEST);
+    ASSERT_GL_NO_ERROR();
+
+    EXPECT_PIXEL_RECT_EQ(0, 0, blitAreaWidth, blitAreaHeight, GLColor::blue);
+    EXPECT_PIXEL_RECT_EQ(blitAreaWidth, 0, readWidth - blitAreaWidth, readHeight, GLColor::black);
+    EXPECT_PIXEL_RECT_EQ(0, blitAreaHeight, blitAreaWidth, readHeight - blitAreaHeight,
+                         GLColor::black);
+
+    // Verify the blitted stencil.  Draw where the stencil is kDrawSurfaceStencil.
+    ANGLE_GL_PROGRAM(greenProgram, essl1_shaders::vs::Passthrough(), essl1_shaders::fs::Green());
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_EQUAL, kDrawSurfaceStencil, 0xFF);
+    drawQuad(greenProgram, essl1_shaders::PositionAttrib(), 0.0f);
+    glDisable(GL_STENCIL_TEST);
+    ASSERT_GL_NO_ERROR();
+
+    EXPECT_PIXEL_RECT_EQ(0, 0, blitAreaWidth, blitAreaHeight, GLColor::green);
+    EXPECT_PIXEL_RECT_EQ(blitAreaWidth, 0, readWidth - blitAreaWidth, readHeight, GLColor::black);
+    EXPECT_PIXEL_RECT_EQ(0, blitAreaHeight, blitAreaWidth, readHeight - blitAreaHeight,
+                         GLColor::black);
+
+    eglDestroySurface(mDisplay, readSurface);
+    eglDestroySurface(mDisplay, drawSurface);
+}
+
+// Blit color and depth/stencil from a larger read surface.  The depth/stencil buffer size of
+// drawSurface limits the blit area.
+TEST_P(EGLSurfaceTest3, BlitColorDepthStencilWithLargerReadSurface)
+{
+    // Read surface: 64x48 (4:3), Draw surface: 24x32 (3:4)
+    verifyColorDepthStencilBlitBetweenDifferentSizes(64, 48, 24, 32);
+}
+
+// Blit color and depth/stencil from a smaller read surface.  The entire readSurface is blitted.
+TEST_P(EGLSurfaceTest3, BlitColorDepthStencilWithSmallerReadSurface)
+{
+    // Read surface: 24x32 (3:4), Draw surface: 64x48 (4:3)
+    verifyColorDepthStencilBlitBetweenDifferentSizes(24, 32, 64, 48);
 }
 
 // Verify switching between a surface with robust resource init and one without still clears alpha.
@@ -4726,6 +4987,194 @@ TEST_P(EGLSurfaceTest, ClearThenPreserve)
 
     // Verify that the clear color is visible after swap.
     EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue);
+}
+
+// Creates a window surface, sets |swapInterval|, enables EGL_BUFFER_PRESERVED, draws a single
+// frame and then swaps several times without drawing, alternating the swap interval between 0
+// and 1 on every frame.  Each change may recreate the swapchain.  The drawn contents must be
+// preserved on every frame.
+void EGLSurfaceTest::runPreserveWithSwapIntervalTest(EGLint swapInterval)
+{
+    // Necessary for some platforms (NVIDIA on Linux) if there is no per-frame window size query.
+    setWindowVisible(mOSWindow, true);
+
+    initializeDisplay();
+
+    constexpr EGLint kSurfaceAttributes[] = {
+        EGL_RED_SIZE,  8, EGL_GREEN_SIZE,   8,
+        EGL_BLUE_SIZE, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_SWAP_BEHAVIOR_PRESERVED_BIT,
+        EGL_NONE};
+
+    EGLint configCount      = 0;
+    EGLConfig surfaceConfig = nullptr;
+    ANGLE_SKIP_TEST_IF(
+        !eglChooseConfig(mDisplay, kSurfaceAttributes, &surfaceConfig, 1, &configCount));
+    ANGLE_SKIP_TEST_IF(configCount == 0);
+    ASSERT_NE(surfaceConfig, nullptr);
+
+    // Skip unless both swap intervals 0 and 1 are supported by the config.
+    EGLint minSwapInterval = 0;
+    EGLint maxSwapInterval = 0;
+    eglGetConfigAttrib(mDisplay, surfaceConfig, EGL_MIN_SWAP_INTERVAL, &minSwapInterval);
+    eglGetConfigAttrib(mDisplay, surfaceConfig, EGL_MAX_SWAP_INTERVAL, &maxSwapInterval);
+    ASSERT_EGL_SUCCESS();
+    ANGLE_SKIP_TEST_IF(minSwapInterval > 0 || maxSwapInterval < 1);
+
+    initializeSurface(surfaceConfig);
+    initializeMainContext();
+    ASSERT_NE(mWindowSurface, EGL_NO_SURFACE);
+
+    eglMakeCurrent(mDisplay, mWindowSurface, mWindowSurface, mContext);
+    ASSERT_EGL_SUCCESS();
+
+    // Set the swap interval
+    EXPECT_EGL_TRUE(eglSwapInterval(mDisplay, swapInterval));
+    ASSERT_EGL_SUCCESS();
+
+    // Enable preserve behavior.
+    EXPECT_EGL_TRUE(
+        eglSurfaceAttrib(mDisplay, mWindowSurface, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED));
+    ASSERT_EGL_SUCCESS();
+
+    // Draw a single frame.
+    ANGLE_GL_PROGRAM(drawBlue, essl1_shaders::vs::Simple(), essl1_shaders::fs::Blue());
+    drawQuad(drawBlue, essl1_shaders::PositionAttrib(), 0.5f);
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue);
+    EXPECT_EGL_TRUE(eglSwapBuffers(mDisplay, mWindowSurface));
+    ASSERT_EGL_SUCCESS();
+
+    // Without drawing anything, the contents must be preserved on every following frame while the
+    // swap interval alternates between 0 and 1.
+    for (int frame = 1; frame <= 6; ++frame)
+    {
+        EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue) << "frame " << frame;
+        EXPECT_EGL_TRUE(eglSwapInterval(mDisplay, (swapInterval + frame) % 2));
+        EXPECT_EGL_TRUE(eglSwapBuffers(mDisplay, mWindowSurface));
+        ASSERT_EGL_SUCCESS();
+    }
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue) << "last frame";
+
+    ASSERT_GL_NO_ERROR();
+}
+
+// Test that EGL_BUFFER_PRESERVED contents are kept across swap interval changes, starting with
+// swap interval 0.  The swapchain is created in FIFO, so the first FIFO -> MAILBOX recreation
+// happens on the same swap where preserve is enabled.
+TEST_P(EGLSurfaceTest, PreserveWithSwapInterval0)
+{
+    runPreserveWithSwapIntervalTest(0);
+}
+
+// Test that EGL_BUFFER_PRESERVED contents are kept across swap interval changes, starting with
+// swap interval 1.  The swapchain stays in FIFO for the first swap, so the first recreation happens
+// after the preserved contents are already in use.
+TEST_P(EGLSurfaceTest, PreserveWithSwapInterval1)
+{
+    runPreserveWithSwapIntervalTest(1);
+}
+
+// Test that an EGL_BUFFER_PRESERVED surface can be resized.  The contents are undefined after the
+// resize, but drawing at the new size must work and the new contents must be preserved on the
+// following swap.
+TEST_P(EGLSurfaceTest, PreserveThenResize)
+{
+    // http://anglebug.com/42263074
+    ANGLE_SKIP_TEST_IF(IsLinux() && IsARM());
+
+    constexpr size_t kSizeCount = 3;
+    constexpr std::array<int, kSizeCount> kWidths{64, 199, 500};
+    constexpr std::array<int, kSizeCount> kHeights{64, 499, 200};
+
+    // Necessary for some platforms (NVIDIA on Linux) if there is no per-frame window size query.
+    setWindowVisible(mOSWindow, true);
+
+    initializeDisplay();
+
+    constexpr EGLint kSurfaceAttributes[] = {
+        EGL_RED_SIZE,  8, EGL_GREEN_SIZE,   8,
+        EGL_BLUE_SIZE, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_SWAP_BEHAVIOR_PRESERVED_BIT,
+        EGL_NONE};
+
+    EGLint configCount      = 0;
+    EGLConfig surfaceConfig = nullptr;
+    ANGLE_SKIP_TEST_IF(
+        !eglChooseConfig(mDisplay, kSurfaceAttributes, &surfaceConfig, 1, &configCount));
+    ANGLE_SKIP_TEST_IF(configCount == 0);
+    ASSERT_NE(surfaceConfig, nullptr);
+
+    initializeSurface(surfaceConfig);
+    initializeMainContext();
+    ASSERT_NE(mWindowSurface, EGL_NO_SURFACE);
+
+    eglMakeCurrent(mDisplay, mWindowSurface, mWindowSurface, mContext);
+    ASSERT_EGL_SUCCESS();
+
+    EXPECT_EGL_TRUE(
+        eglSurfaceAttrib(mDisplay, mWindowSurface, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED));
+    ASSERT_EGL_SUCCESS();
+
+    // The buffer age reported for a preserved surface after a resize is only defined for the
+    // Vulkan backend here.
+    const bool checkBufferAge =
+        isVulkanRenderer() && IsEGLDisplayExtensionEnabled(mDisplay, "EGL_EXT_buffer_age");
+
+    for (size_t i = 1; i < kSizeCount; ++i)
+    {
+        // Resize after create/swap (before draw).
+        mOSWindow->resize(kWidths[i], kHeights[i]);
+
+        // The contents are undefined after the resize, so the buffer age must be 0.
+        if (checkBufferAge)
+        {
+            EGLint age = -1;
+            EXPECT_EGL_TRUE(eglQuerySurface(mDisplay, mWindowSurface, EGL_BUFFER_AGE_EXT, &age));
+            EXPECT_EQ(age, 0);
+        }
+
+        EGLint surfaceWidth  = 0;
+        EGLint surfaceHeight = 0;
+
+        // Some platforms may resize the surface before draw, while others may wait until swap.
+        eglQuerySurface(mDisplay, mWindowSurface, EGL_WIDTH, &surfaceWidth);
+        eglQuerySurface(mDisplay, mWindowSurface, EGL_HEIGHT, &surfaceHeight);
+        ASSERT_EGL_SUCCESS();
+        if (surfaceWidth == kWidths[i])
+        {
+            EXPECT_EQ(surfaceHeight, kHeights[i]);
+        }
+        else
+        {
+            EXPECT_EQ(surfaceWidth, kWidths[i - 1]);
+            EXPECT_EQ(surfaceHeight, kHeights[i - 1]);
+        }
+
+        // Actual buffer size must match the reported size.
+        EXPECT_EQ(drawSizeCheckRect(mWindowSurface, surfaceWidth, surfaceHeight), 0);
+        glDisable(GL_SCISSOR_TEST);
+
+        // Start a new frame.
+        eglSwapBuffers(mDisplay, mWindowSurface);
+        ASSERT_EGL_SUCCESS();
+
+        // The new contents must be preserved.
+        if (checkBufferAge)
+        {
+            EGLint age = -1;
+            EXPECT_EGL_TRUE(eglQuerySurface(mDisplay, mWindowSurface, EGL_BUFFER_AGE_EXT, &age));
+            EXPECT_EQ(age, 1);
+        }
+        EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
+        EXPECT_PIXEL_COLOR_EQ(1, 1, GLColor::red);
+        EXPECT_PIXEL_COLOR_EQ(surfaceWidth - 2, surfaceHeight - 2, GLColor::red);
+        EXPECT_PIXEL_COLOR_EQ(surfaceWidth - 1, surfaceHeight - 1, GLColor::green);
+
+        // End the frame started by the checks above, so the next resize is seen at the start of
+        // the next frame.
+        eglSwapBuffers(mDisplay, mWindowSurface);
+        ASSERT_EGL_SUCCESS();
+    }
+
+    ASSERT_GL_NO_ERROR();
 }
 
 // Test that a window surface can be created with the core EGL 1.5 eglCreatePlatformWindowSurface.

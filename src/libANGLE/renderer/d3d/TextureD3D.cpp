@@ -633,7 +633,8 @@ angle::Result TextureD3D::fastUnpackPixels(const gl::Context *context,
                                            const gl::Box &destArea,
                                            GLenum sizedInternalFormat,
                                            GLenum type,
-                                           RenderTargetD3D *destRenderTarget)
+                                           RenderTargetD3D *destRenderTarget,
+                                           GLint level)
 {
     bool check = (unpack.skipRows != 0 || unpack.skipPixels != 0 || unpack.imageHeight != 0 ||
                   unpack.skipImages != 0);
@@ -655,6 +656,12 @@ angle::Result TextureD3D::fastUnpackPixels(const gl::Context *context,
     ANGLE_TRY(mRenderer->fastCopyBufferToTexture(
         context, unpack, unpackBuffer, static_cast<unsigned int>(offset), destRenderTarget,
         sizedInternalFormat, type, destArea));
+
+    // fastCopyBufferToTexture writes directly to the destination level's RTV on the GPU, bypassing
+    // CPU staging (updateSubresourceLevel) and gl::Framebuffer attachment dirty notifications, so
+    // we must explicitly invalidate the level's swizzle cache here.
+    ASSERT(mTexStorage);
+    mTexStorage->markLevelDirty(level);
 
     return angle::Result::Continue;
 }
@@ -1373,7 +1380,8 @@ angle::Result TextureD3D_2D::setImage(const gl::Context *context,
                          1);
 
         ANGLE_TRY(fastUnpackPixels(context, unpack, unpackBuffer, pixels, destArea,
-                                   internalFormatInfo.sizedInternalFormat, type, destRenderTarget));
+                                   internalFormatInfo.sizedInternalFormat, type, destRenderTarget,
+                                   index.getLevelIndex()));
 
         // Ensure we don't overwrite our newly initialized data
         mImageArray[index.getLevelIndex()]->markClean();
@@ -1411,7 +1419,7 @@ angle::Result TextureD3D_2D::setSubImage(const gl::Context *context,
         ASSERT(!mImageArray[index.getLevelIndex()]->isDirty());
 
         return fastUnpackPixels(context, unpack, unpackBuffer, pixels, area, mipFormat, type,
-                                renderTarget);
+                                renderTarget, index.getLevelIndex());
     }
     else
     {
@@ -1471,9 +1479,12 @@ angle::Result TextureD3D_2D::copyImage(const gl::Context *context,
                    sourceArea.y + sourceArea.height > fbSize.height;
 
     const gl::FramebufferAttachment *readAttachment = source->getReadColorAttachment();
+    // All mip levels share mTexStorage and base-level completeness. Do not restrict this check to
+    // matching mip levels: redefining any level (such as mip 0) when reading from another level of
+    // the same texture can release mTexStorage and leave the source level mip-incomplete in the
+    // recreated storage before the copy reads it.
     const bool isSelfCopy = readAttachment && readAttachment->type() == GL_TEXTURE &&
-                            GetImplAs<TextureD3D>(readAttachment->getTexture()) == this &&
-                            readAttachment->mipLevel() == index.getLevelIndex();
+                            GetImplAs<TextureD3D>(readAttachment->getTexture()) == this;
 
     // If redefining the destination would invalidate the source attachment, snapshot the source
     // first.
@@ -2184,10 +2195,12 @@ angle::Result TextureD3D_Cube::copyImage(const gl::Context *context,
                    sourceArea.y + sourceArea.height > fbSize.height;
 
     const gl::FramebufferAttachment *readAttachment = source->getReadColorAttachment();
+    // All faces and mip levels share mTexStorage and cube/mip completeness. Do not restrict this
+    // check to matching faces or mip levels: redefining any face or level when reading from another
+    // subresource of the same cube map can release mTexStorage and invalidate the source attachment
+    // before the copy reads it.
     const bool isSelfCopy = readAttachment && readAttachment->type() == GL_TEXTURE &&
-                            GetImplAs<TextureD3D>(readAttachment->getTexture()) == this &&
-                            readAttachment->mipLevel() == index.getLevelIndex() &&
-                            readAttachment->cubeMapFace() == index.getTarget();
+                            GetImplAs<TextureD3D>(readAttachment->getTexture()) == this;
 
     if (isSelfCopy)
     {
@@ -2646,6 +2659,7 @@ angle::Result TextureD3D_Cube::updateStorageFaceLevel(const gl::Context *context
     ASSERT(level >= 0 && static_cast<size_t>(faceIndex) < gl::kCubeFaceCount &&
            level < static_cast<int>(mImageArray[faceIndex].size()) &&
            mImageArray[faceIndex][level] != nullptr);
+    ASSERT(isFaceLevelComplete(faceIndex, level));
     ImageD3D *image = mImageArray[faceIndex][level].get();
 
     if (image->isDirty())
@@ -2830,7 +2844,8 @@ angle::Result TextureD3D_3D::setImage(const gl::Context *context,
                          getDepth(index.getLevelIndex()));
 
         ANGLE_TRY(fastUnpackPixels(context, unpack, unpackBuffer, pixels, destArea,
-                                   internalFormatInfo.sizedInternalFormat, type, destRenderTarget));
+                                   internalFormatInfo.sizedInternalFormat, type, destRenderTarget,
+                                   index.getLevelIndex()));
 
         // Ensure we don't overwrite our newly initialized data
         mImageArray[index.getLevelIndex()]->markClean();
@@ -2866,7 +2881,7 @@ angle::Result TextureD3D_3D::setSubImage(const gl::Context *context,
         ASSERT(!mImageArray[index.getLevelIndex()]->isDirty());
 
         return fastUnpackPixels(context, unpack, unpackBuffer, pixels, area, mipFormat, type,
-                                destRenderTarget);
+                                destRenderTarget, index.getLevelIndex());
     }
     else
     {

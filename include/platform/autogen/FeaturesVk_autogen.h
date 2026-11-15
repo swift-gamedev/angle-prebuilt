@@ -860,6 +860,18 @@ struct FeaturesVk : FeatureSetBase
         &members,
     };
 
+    FeatureInfo supportsColorBlendEnableDynamicState = {
+        "supportsColorBlendEnableDynamicState",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo supportsColorWriteMaskDynamicState = {
+        "supportsColorWriteMaskDynamicState",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
     FeatureInfo supportsDepthClampEnableDynamicState = {
         "supportsDepthClampEnableDynamicState",
         FeatureCategory::VulkanFeatures,
@@ -872,6 +884,12 @@ struct FeaturesVk : FeatureSetBase
         &members,
     };
 
+    FeatureInfo supportsLineRasterizationModeDynamicState = {
+        "supportsLineRasterizationModeDynamicState",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
     FeatureInfo supportsLogicOpEnableDynamicState = {
         "supportsLogicOpEnableDynamicState",
         FeatureCategory::VulkanFeatures,
@@ -880,6 +898,12 @@ struct FeaturesVk : FeatureSetBase
 
     FeatureInfo supportsPolygonModeDynamicState = {
         "supportsPolygonModeDynamicState",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo supportsRasterizationSamplesDynamicState = {
+        "supportsRasterizationSamplesDynamicState",
         FeatureCategory::VulkanFeatures,
         &members,
     };
@@ -1280,6 +1304,12 @@ struct FeaturesVk : FeatureSetBase
         &members,
     };
 
+    FeatureInfo avoidRelaxedPrecisionOnIntegers = {
+        "avoidRelaxedPrecisionOnIntegers",
+        FeatureCategory::VulkanWorkarounds,
+        &members,
+    };
+
     FeatureInfo wrapSwitchInIfTrue = {
         "wrapSwitchInIfTrue",
         FeatureCategory::VulkanWorkarounds,
@@ -1622,12 +1652,6 @@ struct FeaturesVk : FeatureSetBase
         &members,
     };
 
-    FeatureInfo supportsClipCullDistanceInGSAndTS = {
-        "supportsClipCullDistanceInGSAndTS",
-        FeatureCategory::VulkanFeatures,
-        &members,
-    };
-
     FeatureInfo supportsMaintenance9 = {
         "supportsMaintenance9",
         FeatureCategory::VulkanFeatures,
@@ -1823,6 +1847,12 @@ struct FeaturesVk : FeatureSetBase
     FeatureInfo allowPipelineBinariesForTesting = {
         "allowPipelineBinariesForTesting",
         FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo disableRGB888RecordableBit = {
+        "disableRGB888RecordableBit",
+        FeatureCategory::VulkanAppWorkarounds,
         &members,
     };
 

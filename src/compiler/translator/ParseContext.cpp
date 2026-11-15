@@ -55,6 +55,11 @@ constexpr size_t kWebGLMaxVariableSizeInBytes        = static_cast<size_t>(2) * 
 constexpr size_t kWebGLMaxPrivateVariableSizeInBytes = static_cast<size_t>(64) * 1024;
 constexpr size_t kWebGLMaxTotalPrivateVariableSizeInBytes = static_cast<size_t>(16) * 1024 * 1024;
 
+// Limit the total number of declared variables and expanded struct/interface-block fields in a
+// shader.  Some drivers use 16-bit integers to index and serialize global variable and struct
+// member info maps, overflowing at 65536 entries.
+constexpr size_t kMaxTotalShaderVariableFields = 32768;
+
 // The 1024 character identifier limit, `-2` for the `_u`
 constexpr size_t kMaxAvailableIdentifierLength = 1022;
 
@@ -338,6 +343,51 @@ void MarkClipCullIndex(const TSourceLoc &line, TIntermTyped *indexExpr, ClipCull
     }
 }
 
+// Returns true if node selects a member of gl_in, e.g. gl_in[i].gl_ClipDistance. The members of
+// gl_in are sized independently of the shader's own gl_ClipDistance and gl_CullDistance.
+bool IsPerVertexInMember(TIntermTyped *node)
+{
+    TIntermBinary *fieldSelection = node->getAsBinaryNode();
+    if (fieldSelection == nullptr || fieldSelection->getOp() != EOpIndexDirectInterfaceBlock)
+    {
+        return false;
+    }
+
+    // Indexing gl_in makes the qualifier temporary, so look at the indexed block itself.
+    TIntermTyped *block = fieldSelection->getLeft();
+    while (TIntermBinary *index = block->getAsBinaryNode())
+    {
+        if (index->getOp() != EOpIndexDirect && index->getOp() != EOpIndexIndirect)
+        {
+            break;
+        }
+        block = index->getLeft();
+    }
+    return block->getQualifier() == EvqPerVertexIn;
+}
+
+// Returns true if the type of a redeclared gl_PerVertex member matches the built-in's type.
+bool IsValidPerVertexMemberType(const ImmutableString &name, const TType &type)
+{
+    if (type.getBasicType() != EbtFloat || type.getSecondarySize() != 1)
+    {
+        return false;
+    }
+    if (name == "gl_Position")
+    {
+        return type.getNominalSize() == 4 && !type.isArray();
+    }
+    if (name == "gl_PointSize")
+    {
+        return type.getNominalSize() == 1 && !type.isArray();
+    }
+    if (name == "gl_ClipDistance" || name == "gl_CullDistance")
+    {
+        return type.getNominalSize() == 1 && type.isArray() && !type.isArrayOfArrays();
+    }
+    return false;
+}
+
 void ValidateFragColorAndFragData(GLenum shaderType,
                                   int shaderVersion,
                                   const TSymbolTable &symbolTable,
@@ -437,6 +487,61 @@ angle::base::CheckedNumeric<size_t> CalculateVariableSize(const TType *type, boo
     return isStd140 ? kVec4Size : type->getNominalSize() * sizeof(float);
 }
 
+// Calculate the number of declared variable and recursively expanded struct/interface-block fields
+// contributed by a variable or field of |type|.
+angle::base::CheckedNumeric<size_t> CalculateVariableFieldCount(
+    const TType *type,
+    TMap<const TFieldListCollection *, size_t> *validatedFieldCollectionCounts)
+{
+    if (type->getBasicType() == EbtStruct || type->getBasicType() == EbtInterfaceBlock)
+    {
+        const TFieldListCollection *fieldCollection =
+            type->getBasicType() == EbtStruct
+                ? static_cast<const TFieldListCollection *>(type->getStruct())
+                : static_cast<const TFieldListCollection *>(type->getInterfaceBlock());
+
+        size_t collectionFieldCount = 0;
+        auto iter                   = validatedFieldCollectionCounts->find(fieldCollection);
+        if (iter != validatedFieldCollectionCounts->end())
+        {
+            collectionFieldCount = iter->second;
+        }
+        else
+        {
+            angle::base::CheckedNumeric<size_t> checkedCollectionFields = 1;
+            for (const TField *field : fieldCollection->fields())
+            {
+                checkedCollectionFields +=
+                    CalculateVariableFieldCount(field->type(), validatedFieldCollectionCounts);
+            }
+            collectionFieldCount =
+                checkedCollectionFields.ValueOrDefault(std::numeric_limits<size_t>::max());
+            (*validatedFieldCollectionCounts)[fieldCollection] = collectionFieldCount;
+        }
+
+        angle::base::CheckedNumeric<size_t> totalFields = collectionFieldCount;
+        for (unsigned int arraySize : type->getArraySizes())
+        {
+            totalFields *= std::max(arraySize, 1u);
+        }
+        return totalFields;
+    }
+
+    // Non-struct, non-interface-block variables (e.g. scalars, vectors, matrices, and
+    // one-dimensional arrays of basic types) count as a single variable entry.  For arrays of
+    // arrays, getArraySizes()[0] is the innermost array dimension, so multiplying only the outer
+    // dimensions counts each innermost one-dimensional array as one entry.
+    angle::base::CheckedNumeric<size_t> totalFields = 1;
+    if (type->isArrayOfArrays())
+    {
+        for (size_t i = 1; i < type->getArraySizes().size(); ++i)
+        {
+            totalFields *= std::max(type->getArraySizes()[i], 1u);
+        }
+    }
+    return totalFields;
+}
+
 unsigned int GetMaxUniformBlocksForShaderType(sh::GLenum shaderType,
                                               const ShCompileOptions &options,
                                               const ShBuiltInResources &resources)
@@ -497,12 +602,17 @@ TIntermDeclaration *RenameAndDeclareStruct(TSymbolTable *symbolTable,
     // always for simplicity.  +1 for the NUL terminator.
     //
     // If appending ID and the name is too long, cut off the end of the name.  The ID makes it
-    // unique.  Where _0 is used, long names are hashed to avoid collision.
+    // unique.  Where _0 is used, long names are hashed to avoid collision; any name longer than the
+    // hash length itself risks collision, if unhashed, with a hashed name.
     constexpr uint32_t kAppendExtraChars = 1 + 11;  // underscore + 32-bit number
 
-    ImmutableStringBuilder builder(structure->name().length() + kAppendExtraChars);
-    if (scope == StructureOriginalScope::Global &&
-        structure->name().length() > kESSLMaxIdentifierLength - kAppendExtraChars)
+    // Hash length is kSHA1Length, and every byte is written as two hex characters
+    constexpr uint32_t kHashChars = 2 * angle::base::kSHA1Length;
+    static_assert(kHashChars < kESSLMaxIdentifierLength - kAppendExtraChars);
+
+    ImmutableStringBuilder builder(std::max<size_t>(structure->name().length(), kHashChars) +
+                                   kAppendExtraChars);
+    if (scope == StructureOriginalScope::Global && structure->name().length() > kHashChars)
     {
         angle::base::SecureHashAlgorithm hasher;
         hasher.Init();
@@ -526,9 +636,9 @@ TIntermDeclaration *RenameAndDeclareStruct(TSymbolTable *symbolTable,
     return DeclareStruct(symbolTable, structure);
 }
 
-unsigned int GetTypeComponentCount(const TType &type)
+angle::CheckedNumeric<unsigned int> GetTypeComponentCount(const TType &type)
 {
-    unsigned int components = 0;
+    angle::CheckedNumeric<unsigned int> components = 0;
     if (type.getBasicType() == EbtInterfaceBlock)
     {
         for (const TField *field : type.getInterfaceBlock()->fields())
@@ -547,7 +657,10 @@ unsigned int GetTypeComponentCount(const TType &type)
     {
         components = static_cast<unsigned int>(type.getNominalSize()) * type.getSecondarySize();
     }
-    components *= type.getArraySizeProduct();
+    for (unsigned int arraySize : type.getArraySizes())
+    {
+        components *= arraySize;
+    }
     return components;
 }
 
@@ -798,7 +911,7 @@ TParseContext::TParseContext(TSymbolTable &symt,
       mNumViews(-1),
       mMaxUniformBlocks(GetMaxUniformBlocksForShaderType(mShaderType, options, resources)),
       mNumUniformBlocks(0),
-      mNumOutputVaryingComponents(0),
+      mNumVaryingComponents(0),
       mDeclaringFunction(false),
       mDeclaringMain(false),
       mMainFunction(nullptr),
@@ -2235,6 +2348,29 @@ bool TParseContext::checkVariableSize(const TSourceLoc &line,
     return true;
 }
 
+bool TParseContext::checkVariableFieldCount(const TSourceLoc &line,
+                                            const ImmutableString &identifier,
+                                            const TType *type)
+{
+    if (!mCompileOptions.limitShaderVariableFieldsAtCompileTime)
+    {
+        return true;
+    }
+
+    const angle::base::CheckedNumeric<size_t> fieldCount =
+        CalculateVariableFieldCount(type, &mValidatedFieldCollectionCounts);
+    mTotalVariableFields += fieldCount;
+    if (mTotalVariableFields.ValueOrDefault(std::numeric_limits<size_t>::max()) >
+        kMaxTotalShaderVariableFields)
+    {
+        error(line, "Number of declared variable fields exceeds implementation-defined limit",
+              identifier);
+        return false;
+    }
+
+    return true;
+}
+
 void TParseContext::checkVaryingLocations(const TSourceLoc &line, const TVariable *variable)
 {
     // This function only checks those varyings with explicit locations for the purposes of conflict
@@ -2622,7 +2758,7 @@ bool TParseContext::declareVariable(const TSourceLoc &line,
         error(line, "redefinition", identifier);
         return false;
     }
-    addAndCheckOutputVaryings(**variable, line);
+    addAndCheckVaryings(**variable, line);
 
     if (!checkIsNonVoid(line, identifier, type->getBasicType()))
     {
@@ -2630,6 +2766,10 @@ bool TParseContext::declareVariable(const TSourceLoc &line,
     }
 
     if (!checkVariableSize(line, identifier, type))
+    {
+        return false;
+    }
+    if (sized == GeomTessArray::Sized && !checkVariableFieldCount(line, identifier, type))
     {
         return false;
     }
@@ -2654,25 +2794,16 @@ void TParseContext::declareIRVariable(const TVariable *variable, GeomTessArray s
     ASSERT(type.isTypeIdSet());
 
     ir::VariableId variableId;
-    switch (type.getQualifier())
+    if (IsPrivate(type.getQualifier()))
     {
-        case EvqTemporary:
-        case EvqGlobal:
-        case EvqConst:
-        case EvqParamIn:
-        case EvqParamOut:
-        case EvqParamInOut:
-        case EvqParamConst:
-            // Temporary variables
-            variableId = mIRBuilder.declareTempVariable(variable->name(), type.typeId(), type);
-            break;
-        default:
-            // Interface and built-in variables
-            variableId = mIRBuilder.declareInterfaceVariable(
-                variable->symbolType() == SymbolType::Empty ? kEmptyImmutableString
-                                                            : variable->name(),
-                type.typeId(), type, ir::DeclarationSource::Shader);
-            break;
+        variableId = mIRBuilder.declareTempVariable(variable->name(), type.typeId(), type);
+    }
+    else
+    {
+        // Interface and built-in variables
+        variableId = mIRBuilder.declareInterfaceVariable(
+            variable->symbolType() == SymbolType::Empty ? kEmptyImmutableString : variable->name(),
+            type.typeId(), type, ir::DeclarationSource::Shader);
     }
     mVariableToId[variable] = VariableToIdInfo{variableId, VariableToIdInfo::kNoImplicitField};
 }
@@ -3537,14 +3668,14 @@ void TParseContext::checkClipCullDistanceWholeArrayUse(const TSourceLoc &locatio
     switch (node->getQualifier())
     {
         case EvqClipDistance:
-            if (mClipDistanceInfo.size == 0)
+            if ((IsPerVertexInMember(node) ? mInputClipDistanceInfo : mClipDistanceInfo).size == 0)
             {
                 error(location, message, "gl_ClipDistance");
                 return;
             }
             break;
         case EvqCullDistance:
-            if (mCullDistanceInfo.size == 0)
+            if ((IsPerVertexInMember(node) ? mInputCullDistanceInfo : mCullDistanceInfo).size == 0)
             {
                 error(location, message, "gl_CullDistance");
                 return;
@@ -6122,6 +6253,7 @@ void TParseContext::sizeUnsizedArrayTypes(uint32_t arraySize)
 
     for (const TVariable *variable : mDeferredArrayVariablesToSize)
     {
+        checkVariableFieldCount(kNoSourceLoc, variable->name(), &variable->getType());
         declareIRVariable(variable, GeomTessArray::Sized);
     }
     mDeferredArrayVariablesToSize.clear();
@@ -6498,6 +6630,7 @@ TIntermFunctionDefinition *TParseContext::addFunctionDefinition(
     {
         const TVariable *param = mCurrentFunction->getParam(paramIndex);
         checkVariableSize(functionPrototype->getLine(), param->name(), &param->getType());
+        checkVariableFieldCount(functionPrototype->getLine(), param->name(), &param->getType());
     }
 
     if (functionBody == nullptr)
@@ -6854,6 +6987,10 @@ TIntermTyped *TParseContext::addConstructor(TFunctionLookup *fnCall, const TSour
     }
 
     checkVariableSize(line, ImmutableString(""), &type);
+    if (type.getBasicType() == EbtStruct || type.isArrayOfArrays())
+    {
+        checkVariableFieldCount(line, kEmptyImmutableString, &type);
+    }
 
     if (!checkConstructorArguments(line, arguments, type))
     {
@@ -6887,7 +7024,7 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
 
     const bool isGLPerVertex = blockName == "gl_PerVertex";
     // gl_PerVertex is allowed to be redefined and therefore not reserved
-    if (!isGLPerVertex)
+    if (!isGLPerVertex || mShaderType == GL_COMPUTE_SHADER || mShaderType == GL_FRAGMENT_SHADER)
     {
         checkIsNotReserved(nameLine, blockName);
     }
@@ -6934,7 +7071,9 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
             if (!isExtensionEnabled(TExtension::OES_shader_io_blocks) &&
                 !isExtensionEnabled(TExtension::EXT_shader_io_blocks) &&
                 !isExtensionEnabled(TExtension::OES_geometry_shader) &&
-                !isExtensionEnabled(TExtension::EXT_geometry_shader) && mShaderVersion < 320)
+                !isExtensionEnabled(TExtension::EXT_geometry_shader) &&
+                !isExtensionEnabled(TExtension::OES_tessellation_shader) &&
+                !isExtensionEnabled(TExtension::EXT_tessellation_shader) && mShaderVersion < 320)
             {
                 error(typeQualifier.line,
                       "invalid qualifier: shader IO blocks need shader io block extension",
@@ -7149,11 +7288,19 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
             case EvqNoPerspectiveSample:
             case EvqGeometryIn:
             case EvqGeometryOut:
+            case EvqTessControlIn:
+            case EvqTessControlOut:
+            case EvqTessEvaluationIn:
+            case EvqTessEvaluationOut:
                 if (!IsShaderIoBlock(typeQualifier.qualifier) &&
                     typeQualifier.qualifier != EvqPatchIn &&
                     typeQualifier.qualifier != EvqPatchOut &&
                     typeQualifier.qualifier != EvqGeometryIn &&
-                    typeQualifier.qualifier != EvqGeometryOut)
+                    typeQualifier.qualifier != EvqGeometryOut &&
+                    typeQualifier.qualifier != EvqTessControlIn &&
+                    typeQualifier.qualifier != EvqTessControlOut &&
+                    typeQualifier.qualifier != EvqTessEvaluationIn &&
+                    typeQualifier.qualifier != EvqTessEvaluationOut)
                 {
                     error(field->line(), "invalid qualifier on interface block member",
                           getQualifierString(qualifier));
@@ -7237,6 +7384,22 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
         // For per-vertex members, apply the appropriate built-in qualifiers to the members.
         if (isGLPerVertex)
         {
+            // The gl_ClipDistance and gl_CullDistance members of gl_in are sized independently of
+            // the shader's output gl_ClipDistance and gl_CullDistance.
+            const bool isPerVertexIn = IsVaryingIn(typeQualifier.qualifier);
+            if (field->name() != "gl_Position" && field->name() != "gl_PointSize" &&
+                field->name() != "gl_ClipDistance" && field->name() != "gl_CullDistance")
+            {
+                error(field->line(),
+                      "invalid member of gl_PerVertex, only gl_Position, gl_PointSize, "
+                      "gl_ClipDistance and gl_CullDistance may be redeclared",
+                      field->name());
+            }
+            else if (!IsValidPerVertexMemberType(field->name(), *field->type()))
+            {
+                error(field->line(), "redeclaration of built-in with a different type",
+                      field->name());
+            }
             if (field->name() == "gl_Position")
             {
                 fieldType->setQualifier(EvqPosition);
@@ -7248,10 +7411,38 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
             if (field->name() == "gl_ClipDistance")
             {
                 fieldType->setQualifier(EvqClipDistance);
+                if (field->type()->isArray())
+                {
+                    if (static_cast<int>(field->type()->getOutermostArraySize()) >
+                        mResources.MaxClipDistances)
+                    {
+                        error(field->line(),
+                              "array index out of range, redeclaration of gl_ClipDistance with "
+                              "size > gl_MaxClipDistances",
+                              field->name());
+                    }
+                    MarkClipCullRedeclaredSize(
+                        field->line(), field->type()->getOutermostArraySize(),
+                        isPerVertexIn ? &mInputClipDistanceInfo : &mClipDistanceInfo);
+                }
             }
             if (field->name() == "gl_CullDistance")
             {
                 fieldType->setQualifier(EvqCullDistance);
+                if (field->type()->isArray())
+                {
+                    if (static_cast<int>(field->type()->getOutermostArraySize()) >
+                        mResources.MaxCullDistances)
+                    {
+                        error(field->line(),
+                              "array index out of range, redeclaration of gl_CullDistance with "
+                              "size > gl_MaxCullDistances",
+                              field->name());
+                    }
+                    MarkClipCullRedeclaredSize(
+                        field->line(), field->type()->getOutermostArraySize(),
+                        isPerVertexIn ? &mInputCullDistanceInfo : &mCullDistanceInfo);
+                }
             }
         }
     }
@@ -7345,6 +7536,10 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
                       instanceName.empty() ? SymbolType::Empty : instanceSymbolType);
 
     checkVariableSize(nameLine, blockName, interfaceBlockType);
+    if (sized == GeomTessArray::Sized)
+    {
+        checkVariableFieldCount(nameLine, blockName, interfaceBlockType);
+    }
     checkVariableLocations(nameLine, instanceVariable);
     declareIRVariable(instanceVariable, sized);
 
@@ -7364,8 +7559,6 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
             // set parent pointer of the field variable
             fieldType->setInterfaceBlockField(interfaceBlock, memberIndex);
 
-            fieldType->setQualifier(typeQualifier.qualifier);
-
             SymbolType symbolType = SymbolType::UserDefined;
             if (field->name() == "gl_Position" || field->name() == "gl_PointSize" ||
                 field->name() == "gl_ClipDistance" || field->name() == "gl_CullDistance")
@@ -7380,6 +7573,10 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
                 }
                 symbolType = SymbolType::BuiltIn;
             }
+            else
+            {
+                fieldType->setQualifier(typeQualifier.qualifier);
+            }
             TVariable *fieldVariable =
                 new TVariable(&symbolTable, field->name(), fieldType, symbolType);
             if (!symbolTable.declare(fieldVariable))
@@ -7387,7 +7584,7 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
                 error(field->line(), "redefinition of an interface block member name",
                       field->name());
             }
-            addAndCheckOutputVaryings(*fieldVariable, field->line());
+            addAndCheckVaryings(*fieldVariable, field->line());
 
             // Don't declare variables for fields of nameless interface blocks in the IR, just
             // remember to implicitly index the instance variable when referenced.
@@ -7417,7 +7614,7 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
         {
             error(instanceLine, "redefinition of an interface block instance name", instanceName);
         }
-        addAndCheckOutputVaryings(*instanceVariable, instanceLine);
+        addAndCheckVaryings(*instanceVariable, instanceLine);
     }
 
     TIntermSymbol *blockSymbol = new TIntermSymbol(instanceVariable);
@@ -7516,10 +7713,16 @@ TIntermTyped *TParseContext::addIndexExpression(TIntermTyped *baseExpression,
             }
             break;
         case EvqClipDistance:
-            MarkClipCullIndex(location, indexExpression, &mClipDistanceInfo);
+            MarkClipCullIndex(location, indexExpression,
+                              IsPerVertexInMember(effectivelyIndexedExpression)
+                                  ? &mInputClipDistanceInfo
+                                  : &mClipDistanceInfo);
             break;
         case EvqCullDistance:
-            MarkClipCullIndex(location, indexExpression, &mCullDistanceInfo);
+            MarkClipCullIndex(location, indexExpression,
+                              IsPerVertexInMember(effectivelyIndexedExpression)
+                                  ? &mInputCullDistanceInfo
+                                  : &mCullDistanceInfo);
             break;
         default:
             break;
@@ -7777,9 +7980,6 @@ int TParseContext::checkIndexLessThan(bool outOfRangeIndexIsError,
     ASSERT(index >= 0);
     if (static_cast<unsigned int>(index) >= arraySize)
     {
-        std::stringstream reasonStream = sh::InitializeStream<std::stringstream>();
-        reasonStream << reason << " '" << index << "'";
-        std::string token = reasonStream.str();
         outOfRangeError(outOfRangeIndexIsError, location, reason, "[]");
         return arraySize - 1;
     }
@@ -10144,6 +10344,16 @@ void TParseContext::trackSamplersPassedToFunction(const TFunction *fnCandidate,
             continue;
         }
 
+        // If GL_EXT_shader_non_constant_global_initializers is enabled, the function call can be at
+        // global scope.  This is not supported yet.
+        if (mCurrentFunction == nullptr)
+        {
+            error(argument->getLine(),
+                  "passing samplers to functions at global scope is currently unsupported",
+                  "sampler");
+            return;
+        }
+
         SamplerAsFunctionArg samplerAsArg;
         samplerAsArg.access         = std::move(access);
         samplerAsArg.callee         = fnCandidate;
@@ -10454,10 +10664,14 @@ TIntermTyped *TParseContext::addMethod(TFunctionLookup *fnCall, const TSourceLoc
         switch (thisNode->getQualifier())
         {
             case EvqClipDistance:
-                MarkClipCullArrayLengthMethodCall(loc, &mClipDistanceInfo);
+                MarkClipCullArrayLengthMethodCall(loc, IsPerVertexInMember(thisNode)
+                                                           ? &mInputClipDistanceInfo
+                                                           : &mClipDistanceInfo);
                 break;
             case EvqCullDistance:
-                MarkClipCullArrayLengthMethodCall(loc, &mCullDistanceInfo);
+                MarkClipCullArrayLengthMethodCall(loc, IsPerVertexInMember(thisNode)
+                                                           ? &mInputCullDistanceInfo
+                                                           : &mCullDistanceInfo);
                 break;
             default:
                 break;
@@ -11246,6 +11460,25 @@ bool TParseContext::postParseChecks()
         error(mClipDistanceInfo.firstEncounter, strstr.str().c_str(), "gl_ClipDistance");
     }
 
+    // The gl_in members of tessellation and geometry shaders are sized independently of the
+    // shader's outputs, so they are checked against the combined limit separately.
+    const unsigned int usedInputClipDistances = getInputClipDistanceArraySize();
+    const unsigned int usedInputCullDistances = getInputCullDistanceArraySize();
+    const unsigned int combinedInputClipAndCullDistances =
+        usedInputClipDistances > 0 && usedInputCullDistances > 0
+            ? usedInputClipDistances + usedInputCullDistances
+            : 0;
+    if (static_cast<int>(combinedInputClipAndCullDistances) >
+        mResources.MaxCombinedClipAndCullDistances)
+    {
+        std::stringstream strstr = sh::InitializeStream<std::stringstream>();
+        strstr << "The sum of 'gl_ClipDistance' and 'gl_CullDistance' size is greater than "
+                  "gl_MaxCombinedClipAndCullDistances ("
+               << combinedInputClipAndCullDistances << " > "
+               << mResources.MaxCombinedClipAndCullDistances << ")";
+        error(mInputClipDistanceInfo.firstEncounter, strstr.str().c_str(), "gl_ClipDistance");
+    }
+
     if (mClipDistanceInfo.hasArrayLengthMethodCall && usedClipDistances == 0)
     {
         error(mClipDistanceInfo.firstEncounter,
@@ -11329,14 +11562,14 @@ bool TParseContext::postParseChecks()
     return numErrors() == 0;
 }
 
-void TParseContext::addAndCheckOutputVaryings(const TVariable &variable, const TSourceLoc &line)
+void TParseContext::addAndCheckVaryings(const TVariable &variable, const TSourceLoc &line)
 {
-    if (mShaderType != GL_VERTEX_SHADER)
+    if (mShaderType != GL_VERTEX_SHADER && mShaderType != GL_FRAGMENT_SHADER)
     {
         return;
     }
 
-    if (!mCompileOptions.limitOutputVaryingsTo256)
+    if (!mCompileOptions.limitVaryingsAtCompileTime)
     {
         return;
     }
@@ -11346,23 +11579,29 @@ void TParseContext::addAndCheckOutputVaryings(const TVariable &variable, const T
         return;
     }
 
-    if (!IsVaryingOut(variable.getType().getQualifier()))
+    const TQualifier qualifier = variable.getType().getQualifier();
+    const bool isTargetVarying = (mShaderType == GL_VERTEX_SHADER && IsVaryingOut(qualifier)) ||
+                                 (mShaderType == GL_FRAGMENT_SHADER && IsVaryingIn(qualifier));
+    if (!isTargetVarying)
     {
         return;
     }
 
-    angle::CheckedNumeric<unsigned int> checkedNum = mNumOutputVaryingComponents;
+    angle::CheckedNumeric<unsigned int> checkedNum = mNumVaryingComponents;
     checkedNum += GetTypeComponentCount(variable.getType());
-    mNumOutputVaryingComponents =
-        checkedNum.ValueOrDefault(std::numeric_limits<unsigned int>::max());
+    mNumVaryingComponents = checkedNum.ValueOrDefault(std::numeric_limits<unsigned int>::max());
 
     // The cap to 256 components seems somewhat arbitrary, but this is intended as a workaround for
     // a specific driver bug, and this limit being much higher than the device limits
-    // (mResources.MaxVertexOutputVectors * 4), it avoids regressing both tests and applications.
-    if (mNumOutputVaryingComponents > 256)
+    // (mResources.MaxVertexOutputVectors * 4 and mResources.MaxFragmentInputVectors * 4), it
+    // avoids regressing both tests and applications.
+    if (mNumVaryingComponents > 256)
     {
-        error(line, "Too many declared shader output varying components for this device",
-              variable.name());
+        const char *errorMessage =
+            mShaderType == GL_VERTEX_SHADER
+                ? "Too many declared shader output varying components for this device"
+                : "Too many declared shader input varying components for this device";
+        error(line, errorMessage, variable.name());
     }
 }
 

@@ -175,10 +175,6 @@ constexpr uint32_t kPreferredDefaultUniformBufferSize = 64 * 1024u;
 // buffers will be larger.
 constexpr size_t kAllocationCountThresholdForDynamicVertexDataSize = 4096;
 
-// Maximum size to use VMA image suballocation. Any allocation greater than or equal to this
-// value will use a dedicated VkDeviceMemory.
-constexpr size_t kImageSizeThresholdForDedicatedMemoryAllocation = 8 * 1024 * 1024;
-
 // Maximum size for an allocated memory for a single object.
 constexpr VkDeviceSize kMemoryAllocationSizeLimit = 1 * 1024 * 1024 * 1024;
 
@@ -240,6 +236,24 @@ bool IsQualcommOpenSource(uint32_t vendorId, uint32_t driverId, const char *devi
     return strstr(deviceName, "Venus") != nullptr || strstr(deviceName, "Turnip") != nullptr;
 }
 
+bool IsXclipse()
+{
+    if (!IsAndroid())
+    {
+        return false;
+    }
+
+    std::string modelName;
+    if (!angle::android::GetSystemProperty(angle::android::kModelSystemPropertyName, &modelName))
+    {
+        return 0;
+    }
+
+    // Improve this when more Xclipse devices are available
+    return strstr(modelName.c_str(), "SM-S901B") != nullptr ||
+           strstr(modelName.c_str(), "SM-S926B") != nullptr;
+}
+
 bool StrLess(const char *a, const char *b)
 {
     return strcmp(a, b) < 0;
@@ -296,8 +310,6 @@ constexpr const char *kSkippedMessages[] = {
     "VUID-VkDescriptorImageInfo-descriptorType-06713",
     // http://crbug.com/1412096
     "VUID-VkImageCreateInfo-pNext-00990",
-    // VVL bug: https://gitlab.khronos.org/vulkan/Vulkan-ValidationLayers/-/merge_requests/582
-    "VUID-VkGraphicsPipelineCreateInfo-externalFormatResolve-09309",
     // Spec bug: https://gitlab.khronos.org/vulkan/vulkan/-/merge_requests/8706
     "VUID-vkCmdDraw-None-09363",
     "VUID-vkCmdDrawIndexed-None-09363",
@@ -2091,6 +2103,45 @@ VkResult RetrieveDeviceLostInfoFromDevice(VkDevice device,
     WARN() << faultString.str();
     return VK_SUCCESS;
 }
+
+#if defined(ANGLE_SHARED_LIBVULKAN)
+// Guards Volk's process-wide state, which is shared by every Renderer: the loadedModule,
+// loadedInstance and loadedDevice statics in volk.c, and all of Volk's vk* function pointer
+// globals, including the promoted *KHR/*EXT aliases assigned by the Init*FromCore() helpers.  That
+// state is defined by Volk, so it cannot live in this class.  Instead, the Volk calls that write it
+// are only reachable through an instance of this class, i.e. while its mutex is held.  The
+// Init*FromCore() aliases must likewise only be assigned while an instance is alive.
+//
+// Renderer initialization and Renderer::reloadVolkIfNeeded() may run concurrently for different
+// Renderers (e.g. eglInitialize on one display and eglMakeCurrent on another) without any other
+// lock in common.  Note that this only serializes writers; Vulkan calls made through the function
+// pointers are not synchronized with it.
+class [[nodiscard]] ScopedVolkLock final : angle::NonCopyable
+{
+  public:
+    ScopedVolkLock() : mLock(GetMutex()) {}
+
+    void initializeLoader(PFN_vkGetInstanceProcAddr getInstanceProcAddr)
+    {
+        VK_CALL(volkInitializeCustom, getInstanceProcAddr);
+    }
+
+    bool isInstanceLoaded(VkInstance instance) const { return volkGetLoadedInstance() == instance; }
+    void loadInstance(VkInstance instance) { VK_CALL(volkLoadInstanceOnly, instance); }
+
+    bool isDeviceLoaded(VkDevice device) const { return volkGetLoadedDevice() == device; }
+    void loadDevice(VkDevice device) { VK_CALL(volkLoadDevice, device); }
+
+  private:
+    static angle::SimpleMutex &GetMutex()
+    {
+        static angle::base::NoDestructor<angle::SimpleMutex> sMutex;
+        return *sMutex;
+    }
+
+    std::lock_guard<angle::SimpleMutex> mLock;
+};
+#endif  // defined(ANGLE_SHARED_LIBVULKAN)
 }  // namespace
 
 // OneOffCommandPool implementation.
@@ -2099,6 +2150,7 @@ OneOffCommandPool::OneOffCommandPool() : mProtectionType(vk::ProtectionType::Inv
 void OneOffCommandPool::init(vk::ProtectionType protectionType)
 {
     ASSERT(!mCommandPool.valid());
+    ASSERT(mPendingCommands.empty());
     mProtectionType = protectionType;
 }
 
@@ -2109,6 +2161,7 @@ void OneOffCommandPool::destroy(VkDevice device)
     {
         pending.commandBuffer.releaseHandle();
     }
+    mPendingCommands.clear();
     mCommandPool.destroy(device);
     mProtectionType = vk::ProtectionType::InvalidEnum;
 }
@@ -2249,6 +2302,7 @@ void Renderer::onDestroy(vk::ErrorContext *context)
     }
 
     (void)(finishResourceUse(context, mSubmittedResourceUse));
+    mSubmittedResourceUse.reset();
 
     if (mPlaceHolderDescriptorSetLayout)
     {
@@ -2427,12 +2481,17 @@ angle::Result Renderer::enableInstanceExtensions(vk::ErrorContext *context,
                                            instanceExtensionNames) &&
                                 useVulkanSwapchain == UseVulkanSwapchain::Yes);
 
+    const bool isSamsungDeviceWithSurfacelessQueryBug = IsXclipse() && GetAndroidSDKVersion() < 36;
+
     // TODO: Validation layer has a bug when vkGetPhysicalDeviceSurfaceFormats2KHR is called
     // on Mock ICD with surface handle set as VK_NULL_HANDLE. http://anglebug.com/42266098
+    // b/267953710: VK_GOOGLE_surfaceless_query isn't working on some Samsung Xclipse builds with
+    // Android API level below 36.
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsSurfacelessQueryExtension,
         ExtensionFound(VK_GOOGLE_SURFACELESS_QUERY_EXTENSION_NAME, instanceExtensionNames) &&
-            useVulkanSwapchain == UseVulkanSwapchain::Yes && !isMockICDEnabled());
+            useVulkanSwapchain == UseVulkanSwapchain::Yes && !isMockICDEnabled() &&
+            !isSamsungDeviceWithSurfacelessQueryBug);
 
     // VK_KHR_external_fence_capabilities and VK_KHR_extenral_semaphore_capabilities are promoted to
     // core in Vulkan 1.1
@@ -2555,7 +2614,10 @@ angle::Result Renderer::initialize(vk::ErrorContext *context,
                 angle::GetLibrarySymbol(mLibVulkanLibrary, "vkGetInstanceProcAddr"));
 
         // Set all vk* function ptrs
-        VK_CALL(volkInitializeCustom, vulkanLoaderGetInstanceProcAddr);
+        {
+            ScopedVolkLock volk;
+            volk.initializeLoader(vulkanLoaderGetInstanceProcAddr);
+        }
 
         uint32_t ver = VK_CALL(volkGetInstanceVersion);
         if (!IsAndroid() && ver < VK_MAKE_API_VERSION(0, 1, 1, 91))
@@ -2718,8 +2780,10 @@ angle::Result Renderer::initialize(vk::ErrorContext *context,
         ANGLE_SCOPED_DISABLE_MSAN();
         ANGLE_VK_TRY(context, VK_CALL(vkCreateInstance, &instanceInfo, nullptr, &mInstance));
 #if defined(ANGLE_SHARED_LIBVULKAN)
-        // Load volk if we are linking dynamically
-        VK_CALL(volkLoadInstance, mInstance);
+        // Load volk if we are linking dynamically.  Keep the lock while the promoted extension
+        // entry points are initialized below, as they are Volk globals too.
+        ScopedVolkLock volk;
+        volk.loadInstance(mInstance);
 #endif  // defined(ANGLE_SHARED_LIBVULKAN)
 
         // For promoted extensions, initialize their entry points from the core version.
@@ -2917,9 +2981,9 @@ angle::Result Renderer::initializeMemoryAllocator(vk::ErrorContext *context)
         ASSERT(mTileMemoyTypeIndex != kInvalidMemoryTypeIndex);
     }
 
-    // The preferred heap block size was picked by looking at memory usage of
-    // Android apps. The allocator will start making blocks at 1/8 the max size
-    // and builds up block size as needed before capping at the max set here.
+    // The preferred heap block size was picked by looking at memory usage of Android apps. Buffer
+    // pools start with a smaller initial block, and double the block size as needed up to the size
+    // set here.
     mPreferredLargeHeapBlockSize = 8 * 1024 * 1024;
 
     // The first allocated buffer block from an empty buffer pool has a smaller size in order to
@@ -3079,15 +3143,24 @@ angle::Result Renderer::initializeMemoryAllocator(vk::ErrorContext *context)
 //                                                                                       (property)
 // - VK_EXT_primitive_topology_list_restart:          primitiveTopologyListRestart (feature)
 // - VK_EXT_extended_dynamic_state3:                  extendedDynamicState3AlphaToCoverageEnable
-//                                                                                       (feature)
+//                                                                                        (feature)
 //                                                    extendedDynamicState3AlphaToOneEnable
-//                                                                                       (feature)
+//                                                                                        (feature)
+//                                                    extendedDynamicState3ColorBlendEnable
+//                                                                                        (feature)
+//                                                    extendedDynamicState3ColorWriteMask (feature)
 //                                                    extendedDynamicState3DepthClampEnable
-//                                                                                       (feature)
+//                                                                                        (feature)
 //                                                    extendedDynamicState3DepthClipNegativeOneToOne
-//                                                                                       (feature)
+//                                                                                        (feature)
+//                                                    extendedDynamicState3LineRasterizationMode
+//                                                                                        (feature)
+//                                                    extendedDynamicState3LineStippleEnable
+//                                                                                        (feature)
 //                                                    extendedDynamicState3LogicOpEnable (feature)
 //                                                    extendedDynamicState3PolygonMode (feature)
+//                                                    extendedDynamicState3RasterizationSamples
+//                                                                                        (feature)
 //                                                    extendedDynamicState3SampleMask (feature)
 //                                                    dynamicPrimitiveTopologyUnrestricted
 //                                                                                       (property)
@@ -4747,6 +4820,10 @@ void Renderer::initDeviceExtensionEntryPoints()
         {
             InitExtendedDynamicState3EXTWithBlendOperationAdvancedEXTFunctions(mDevice);
         }
+        if (getFeatures().bresenhamLineRasterization.enabled)
+        {
+            InitExtendedDynamicState3EXTWithLineRasterizationEXTFunctions(mDevice);
+        }
     }
     if (mFeatures.supportsFragmentShadingRate.enabled)
     {
@@ -4767,10 +4844,6 @@ void Renderer::initDeviceExtensionEntryPoints()
     if (mFeatures.supportsVertexInputDynamicState.enabled)
     {
         InitVertexInputDynamicStateEXTFunctions(mDevice);
-    }
-    if (mFeatures.supportsDynamicRenderingLocalRead.enabled)
-    {
-        InitDynamicRenderingLocalReadFunctions(mDevice);
     }
     if (mFeatures.supportsExternalSemaphoreFd.enabled ||
         mFeatures.supportsExternalSemaphoreFuchsia.enabled)
@@ -5065,12 +5138,17 @@ angle::Result Renderer::createDeviceAndQueue(vk::ErrorContext *context,
     initializeValidationMessageSuppressions();
 
     ANGLE_VK_TRY(context, VK_CALL(vkCreateDevice, mPhysicalDevice, &createInfo, nullptr, &mDevice));
+    {
 #if defined(ANGLE_SHARED_LIBVULKAN)
-    // Load volk if we are loading dynamically
-    VK_CALL(volkLoadDevice, mDevice);
+        // Load volk if we are loading dynamically.  Keep the lock while
+        // initDeviceExtensionEntryPoints() aliases the promoted extension entry points, as they are
+        // Volk globals too.
+        ScopedVolkLock volk;
+        volk.loadDevice(mDevice);
 #endif  // defined(ANGLE_SHARED_LIBVULKAN)
 
-    initDeviceExtensionEntryPoints();
+        initDeviceExtensionEntryPoints();
+    }
 
     ANGLE_TRY(mCommandQueue.init(context, queueFamily, enableProtectedContent, queueCount));
     ANGLE_TRY(mCleanUpThread.init());
@@ -6023,12 +6101,12 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
         &mFeatures, supportsPrimitiveTopologyListRestart,
         mPrimitiveTopologyListRestartFeatures.primitiveTopologyListRestart == VK_TRUE);
 
-    // Adreno 702 applies advanced blend twice to some samples of multisampled pixels covered by two
-    // primitives sharing an edge; the framebuffer fetch emulation renders them correctly.
+    // Adreno 622 and 702 misrender pixels along shared primitive edges with
+    // VK_EXT_blend_operation_advanced; framebuffer fetch emulation renders them correctly.
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsBlendOperationAdvanced,
         ExtensionFound(VK_EXT_BLEND_OPERATION_ADVANCED_EXTENSION_NAME, deviceExtensionNames) &&
-            !(isQualcommProprietary && isAdreno702));
+            !(isQualcommProprietary && (isAdreno622 || isAdreno702)));
 
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsFormatFeatureFlags2,
@@ -6260,6 +6338,8 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     ANGLE_FEATURE_CONDITION(&mFeatures, splitCrossFormatLayeredImageCopy,
                             isQualcommProprietary && (isAdreno622 || isAdreno702));
     ANGLE_FEATURE_CONDITION(&mFeatures, mutableFormatForIntColorImages,
+                            isQualcommProprietary && (isAdreno622 || isAdreno702));
+    ANGLE_FEATURE_CONDITION(&mFeatures, avoidRelaxedPrecisionOnIntegers,
                             isQualcommProprietary && (isAdreno622 || isAdreno702));
 
     ANGLE_FEATURE_CONDITION(
@@ -6684,6 +6764,34 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     const bool isRasterizerDiscardDynamicState =
         mFeatures.useRasterizerDiscardEnableDynamicState.enabled;
 
+    // Line rasterization can be made dynamic if Bresenham lines are supported at all and can be
+    // made dynamic.  However, Vulkan also requires that if stippled lines are supported in any
+    // form, that stipple-line-enable is also set.  ANGLE always disable stippled lines, so only the
+    // lineStippleEnable dynamic state is needed (and not lineStipple, which would set the stipple
+    // pattern).
+    ANGLE_FEATURE_CONDITION(
+        &mFeatures, supportsLineRasterizationModeDynamicState,
+        mFeatures.supportsExtendedDynamicState3.enabled &&
+            mFeatures.bresenhamLineRasterization.enabled &&
+            mExtendedDynamicState3Features.extendedDynamicState3LineRasterizationMode == VK_TRUE &&
+            (!supportsStippledLines() ||
+             mExtendedDynamicState3Features.extendedDynamicState3LineStippleEnable) &&
+            isRasterizerDiscardDynamicState);
+
+    // Bresenham lines should **not** be enabled if:
+    //
+    // * multisampling (http://anglebug.com/42262723), or
+    // * (according to VUID-vkCmdDraw-None-10608), any of the following is enabled:
+    //   * alphaToCoverageEnable,
+    //   * alphaToOneEnable
+    //   * sampleShadingEnable
+    //
+    // We cannot support these state being dynamic if bresenham line state is static as pipeline
+    // creation decides to use bresenham lines based on the other state's static value.
+    const bool hasStaticBresenhamLineState =
+        mFeatures.bresenhamLineRasterization.enabled &&
+        !mFeatures.supportsLineRasterizationModeDynamicState.enabled;
+
     // Disabled on Intel/windows drivers, failing
     // FramebufferFetchES31.DrawNonFetchDrawFetchInStorageBuffer*,
     // SimpleStateChangeTestES31.FragWriteSSBOThenChangeDrawbuffersThenWriteSSBO*,
@@ -6695,15 +6803,27 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
         &mFeatures, supportsAlphaToCoverageEnableDynamicState,
         mFeatures.supportsExtendedDynamicState3.enabled &&
             mExtendedDynamicState3Features.extendedDynamicState3AlphaToCoverageEnable == VK_TRUE &&
-            isRasterizerDiscardDynamicState && !(isIntel && IsWindows()) &&
-            !(isIntel && IsLinux()));
+            isRasterizerDiscardDynamicState && !hasStaticBresenhamLineState &&
+            !(isIntel && IsWindows()) && !(isIntel && IsLinux()));
 
     // Disabled on Imagination drivers due to test failures and device loss.
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsAlphaToOneEnableDynamicState,
         mFeatures.supportsExtendedDynamicState3.enabled &&
             mExtendedDynamicState3Features.extendedDynamicState3AlphaToOneEnable == VK_TRUE &&
-            isRasterizerDiscardDynamicState && !isPowerVR);
+            isRasterizerDiscardDynamicState && !hasStaticBresenhamLineState && !isPowerVR);
+
+    ANGLE_FEATURE_CONDITION(
+        &mFeatures, supportsColorBlendEnableDynamicState,
+        mFeatures.supportsExtendedDynamicState3.enabled &&
+            mExtendedDynamicState3Features.extendedDynamicState3ColorBlendEnable == VK_TRUE &&
+            isRasterizerDiscardDynamicState);
+
+    ANGLE_FEATURE_CONDITION(
+        &mFeatures, supportsColorWriteMaskDynamicState,
+        mFeatures.supportsExtendedDynamicState3.enabled &&
+            mExtendedDynamicState3Features.extendedDynamicState3ColorWriteMask == VK_TRUE &&
+            isRasterizerDiscardDynamicState);
 
     // Disabled on Imagination drivers due to failure of a few dEQP tests.
     ANGLE_FEATURE_CONDITION(
@@ -6733,6 +6853,16 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
         mFeatures.supportsExtendedDynamicState3.enabled &&
             mExtendedDynamicState3Features.extendedDynamicState3PolygonMode == VK_TRUE &&
             !isPowerVR);
+
+    // Disabled on old Nvidia drivers due to multisample test failures in dEQP as well as
+    // TextureSampleShadingTest.Basic.  Failures were observed on the 535 driver, but not on 610.
+    // Unknown at which version the driver is fixed.
+    ANGLE_FEATURE_CONDITION(
+        &mFeatures, supportsRasterizationSamplesDynamicState,
+        mFeatures.supportsExtendedDynamicState3.enabled &&
+            mExtendedDynamicState3Features.extendedDynamicState3RasterizationSamples == VK_TRUE &&
+            isRasterizerDiscardDynamicState && !hasStaticBresenhamLineState &&
+            !(isNvidia && driverVersion < angle::VersionTriple(610, 0, 0)));
 
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsSampleMaskDynamicState,
@@ -6914,22 +7044,26 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
 
     // To avoid memory bloating due to using pipeline caches per program, the pipeline cache in the
     // renderer can be used.
+    // Also explicitly prefer the global cache (otherwise, it will be used implicitly):
+    // - when warm up is disabled - program's cache will be empty at draw time, in which case using
+    //   global cache is better.
+    // - when skipping serialization - to avoid creating per program caches unnecessarily.
     ANGLE_FEATURE_CONDITION(&mFeatures, preferGlobalPipelineCache,
-                            isNvidia || (isAMD && !isRADV) || isSamsung || isQualcommProprietary);
+                            !mFeatures.warmUpPipelineCacheAtLink.enabled ||
+                                mFeatures.skipPipelineCacheSerialization.enabled || isNvidia ||
+                                (isAMD && !isRADV) || isSamsung || isQualcommProprietary);
 
     // Whether the pipeline caches should merge into the global pipeline cache.  This should only be
     // enabled on platforms if:
     //
-    // - preferGlobalPipelineCache is not enabled
-    // - VK_EXT_graphics_pipeline_library is not supported.  In that case, only the program's cache
-    //   used during warm up is merged into the global cache for later monolithic pipeline creation.
+    // - allowProgramPipelineCache() is true
     // - VK_EXT_graphics_pipeline_library is supported, monolithic pipelines are preferred, and the
     //   driver is able to reuse blobs from partial pipelines when creating monolithic pipelines.
     ANGLE_FEATURE_CONDITION(&mFeatures, mergeProgramPipelineCachesToGlobalCache,
-                            !mFeatures.preferGlobalPipelineCache.enabled &&
-                                (!mFeatures.supportsGraphicsPipelineLibrary.enabled ||
-                                 (mFeatures.preferMonolithicPipelinesOverLibraries.enabled &&
-                                  libraryBlobsAreReusedByMonolithicPipelines)));
+                            allowProgramPipelineCache() &&
+                                mFeatures.supportsGraphicsPipelineLibrary.enabled &&
+                                mFeatures.preferMonolithicPipelinesOverLibraries.enabled &&
+                                libraryBlobsAreReusedByMonolithicPipelines);
 
     // Whether all accesses to pipeline cache need to be externally synchronized. This should only
     // be enabled on platforms if:
@@ -6950,22 +7084,20 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     // Sync global pipeline cache to the blob cache occasionally on platforms that would benefit
     // from it:
     //
-    // - VK_EXT_graphics_pipeline_library is not supported, and the program cache is not warmed up:
-    //   If the pipeline cache is being warmed up at link time, the blobs corresponding to each
-    //   program is individually retrieved and stored in the blob cache already.
+    // - the program pipeline cache use is not allowed (only allowed when warmed up):
+    //   If the program pipeline cache is being warmed up at link time, the blobs corresponding to
+    //   each program is individually retrieved and stored in the blob cache already.
     // - VK_EXT_graphics_pipeline_library is supported, but monolithic pipelines are still
     //   preferred, and the cost of syncing the large cache is acceptable.
     //
     // Otherwise global pipeline cache is recreated on every run.
-    const bool hasNoPipelineWarmUp = !mFeatures.supportsGraphicsPipelineLibrary.enabled &&
-                                     !mFeatures.warmUpPipelineCacheAtLink.enabled;
     const bool canSyncLargeMonolithicCache =
         mFeatures.supportsGraphicsPipelineLibrary.enabled &&
         mFeatures.preferMonolithicPipelinesOverLibraries.enabled &&
         (!IsAndroid() || mFeatures.enableAsyncPipelineCacheCompression.enabled);
     ANGLE_FEATURE_CONDITION(&mFeatures, syncGlobalPipelineCacheToBlobCache,
                             !mFeatures.skipPipelineCacheSerialization.enabled &&
-                                (hasNoPipelineWarmUp || canSyncLargeMonolithicCache));
+                                (!allowProgramPipelineCache() || canSyncLargeMonolithicCache));
 
     // Enable the feature on Samsung by default, because it has big blob cache.
     ANGLE_FEATURE_CONDITION(&mFeatures, useDualPipelineBlobCacheSlots, isSamsung);
@@ -7123,13 +7255,10 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     // VkEvent instead of GPU overhead associated with vkCmdResetEvent.
     ANGLE_FEATURE_CONDITION(&mFeatures, recycleVkEvent, isSwiftShader);
 
-    // Disabled on older Nvidia drivers due to a bug with attachment location mapping, resulting in
-    // incorrect rendering in the presence of gaps in locations.  http://anglebug.com/372883691.
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsDynamicRenderingLocalRead,
         mFeatures.supportsDynamicRendering.enabled &&
-            mDynamicRenderingLocalReadFeatures.dynamicRenderingLocalRead == VK_TRUE &&
-            !(isNvidia && driverVersion < angle::VersionTriple(596, 8, 0)));
+            mDynamicRenderingLocalReadFeatures.dynamicRenderingLocalRead == VK_TRUE);
 
     // Using dynamic rendering when VK_KHR_dynamic_rendering_local_read is available, because that's
     // needed for framebuffer fetch, MSRTT and advanced blend emulation.
@@ -7138,12 +7267,8 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     // dynamic rendering.  If only version 1 is exposed, it's not sacrificied for dynamic rendering
     // and render pass objects are continued to be used.
     //
-    // Using dynamic rendering when emulating GL_EXT_multisampled_render_to_texture is
-    // supported. Except for SwiftShader, which crashes when binding non-attachment textures as
-    // input attachments.
-    //
     // Use of dynamic rendering is disabled on ARM due to driver bugs
-    // (http://issuetracker.google.com/356051947, http://issuetracker.google.com/575550012).
+    // (http://issuetracker.google.com/356051947).
     //
     // Use of dynamic rendering is disabled on older Qualcomm drivers due to driver bugs
     // (http://crbug.com/415738891).
@@ -7157,7 +7282,7 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
         &mFeatures, preferDynamicRendering,
         mFeatures.supportsDynamicRendering.enabled &&
             mFeatures.supportsDynamicRenderingLocalRead.enabled && !hasLegacyDitheringV1 &&
-            !isSwiftShader && !isARM &&
+            !(isARMProprietary && driverVersion < angle::VersionTriple(52, 0, 0)) &&
             !(isQualcommProprietary && driverVersion < angle::VersionTriple(512, 801, 0)) &&
             !isPowerVR);
 
@@ -7209,11 +7334,6 @@ void Renderer::initFeatures(const vk::ExtensionNameList &deviceExtensionNames,
     ANGLE_FEATURE_CONDITION(
         &mFeatures, supportsAstcHdr3dTextures,
         mFeatures.supportsTextureCompressionAstcHdr.enabled && CanSupportAstcHdr3D(this));
-
-    // http://anglebug.com/42264006
-    // GL_EXT_clip_cull_distance also adds features to geometry and tessellation shaders, which are
-    // currently disabled.
-    ANGLE_FEATURE_CONDITION(&mFeatures, supportsClipCullDistanceInGSAndTS, false);
 
     // http://anglebug.com/442950569
     // feature is currently experimental (i.e. dont default enable even if device supports it)
@@ -8039,22 +8159,19 @@ void Renderer::setGlobalDebugAnnotator(bool *installedAnnotatorOut)
 void Renderer::reloadVolkIfNeeded() const
 {
 #if defined(ANGLE_SHARED_LIBVULKAN)
-    // Volk tracks the currently loaded VkInstance/VkDevice and function pointers in unprotected
-    // global variables, and sets loadedInstance/loadedDevice before populating the function
-    // pointers. Protect the check and reload with a static mutex so concurrent threads (e.g. during
-    // eglMakeCurrent) do not race on Volk globals or observe partially loaded entry points.
-    static angle::base::NoDestructor<angle::SimpleMutex> sVolkMutex;
-    std::unique_lock<angle::SimpleMutex> lock(*sVolkMutex);
+    // Volk sets loadedInstance/loadedDevice before populating the function pointers, so the check
+    // and the reload must be done under the same lock.
+    ScopedVolkLock volk;
 
-    if ((mInstance != VK_NULL_HANDLE) && (volkGetLoadedInstance() != mInstance))
+    if ((mInstance != VK_NULL_HANDLE) && !volk.isInstanceLoaded(mInstance))
     {
-        VK_CALL(volkLoadInstance, mInstance);
+        volk.loadInstance(mInstance);
         initializeInstanceExtensionEntryPointsFromCore();
     }
 
-    if ((mDevice != VK_NULL_HANDLE) && (volkGetLoadedDevice() != mDevice))
+    if ((mDevice != VK_NULL_HANDLE) && !volk.isDeviceLoaded(mDevice))
     {
-        VK_CALL(volkLoadDevice, mDevice);
+        volk.loadDevice(mDevice);
         initializeDeviceExtensionEntryPointsFromCore();
     }
 #endif  // defined(ANGLE_SHARED_LIBVULKAN)
@@ -8636,9 +8753,10 @@ VkResult ImageMemorySuballocator::getDefaultMemoryPool(Renderer *renderer,
                              getDefaultPoolBlockSize(renderer), poolMemoryTypeIndex, poolOut);
 }
 
-bool ImageMemorySuballocator::needsDedicatedMemory(VkDeviceSize size) const
+bool ImageMemorySuballocator::needsDedicatedMemory(Renderer *renderer, VkDeviceSize size) const
 {
-    return size >= kImageSizeThresholdForDedicatedMemoryAllocation;
+    // Like VMA's default pools, images over half a block get dedicated memory to avoid waste.
+    return size > getDefaultPoolBlockSize(renderer) / 2;
 }
 
 VkDeviceSize ImageMemorySuballocator::getInitialPoolBlockSize(Renderer *renderer,
@@ -8647,7 +8765,7 @@ VkDeviceSize ImageMemorySuballocator::getInitialPoolBlockSize(Renderer *renderer
     return renderer->getPreferredInitialImageBlockSize(poolMemoryTypeIndex);
 }
 
-VkDeviceSize ImageMemorySuballocator::getDefaultPoolBlockSize(Renderer *renderer)
+VkDeviceSize ImageMemorySuballocator::getDefaultPoolBlockSize(Renderer *renderer) const
 {
     return renderer->getPreferredLargeHeapBlockSize();
 }

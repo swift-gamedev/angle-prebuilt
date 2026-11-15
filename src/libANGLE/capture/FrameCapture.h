@@ -187,8 +187,8 @@ using DefaultUniformLocationsSet = std::set<gl::UniformLocation>;
 using DefaultUniformLocationsPerProgramMap =
     std::map<gl::ShaderProgramID, DefaultUniformLocationsSet>;
 
-// A map of programs which maps to locations and their reset calls
-using DefaultUniformCallsPerLocationMap = std::map<gl::UniformLocation, std::vector<CallCapture>>;
+// A map of programs which maps to locations and their reset call
+using DefaultUniformCallsPerLocationMap = std::map<gl::UniformLocation, CallCapture>;
 using DefaultUniformCallsPerProgramMap =
     std::map<gl::ShaderProgramID, DefaultUniformCallsPerLocationMap>;
 
@@ -1256,7 +1256,14 @@ void CaptureEGLCallToFrameCapture(CaptureFuncT captureFunc,
         egl::Display *display = GetEGLDisplayArg(captureParams...);
         if (display)
         {
-            context = display->getState().contextMap.first();
+            // Capture needs deterministic output so use the lowest context ID to avoid
+            // platform-dependent map ordering
+            display->getState().contextMap.forEach([&](gl::Context *displayContext) {
+                if (context == nullptr || displayContext->id() < context->id())
+                {
+                    context = displayContext;
+                }
+            });
         }
         if (!context)
         {

@@ -5,9 +5,9 @@
 //
 
 #include <array>
+#include <iomanip>
 #include <sstream>
 #include <string>
-#include "common/unsafe_buffers.h"
 #include "test_utils/ANGLETest.h"
 #include "test_utils/gl_raii.h"
 
@@ -2164,16 +2164,13 @@ void PixelLocalStorageTest::doCoherencyTest(CoherencyMode coherencyMode)
     glDrawBuffers(0, nullptr);
 
     std::vector<uint8_t> expected(H * W * 4);
-    ANGLE_UNSAFE_TODO(memset(expected.data(), 0, H * W * 4));
 
     // This test times out on Swiftshader and noncoherent backends if we draw anywhere near the
     // same number of boxes as we do on coherent, hardware backends.
-    int boxesPerList =
-        !IsGLExtensionEnabled("GL_ANGLE_shader_pixel_local_storage_coherent") ||
-                coherencyMode != CoherencyMode::Default ||
-                ANGLE_UNSAFE_TODO(strstr((const char *)glGetString(GL_RENDERER), "SwiftShader"))
-            ? 200
-            : H * W * 3;
+    int boxesPerList = !IsGLExtensionEnabled("GL_ANGLE_shader_pixel_local_storage_coherent") ||
+                               coherencyMode != CoherencyMode::Default || isSwiftshader()
+                           ? 200
+                           : H * W * 3;
 
     // Prepare a ton of random sized boxes in various draws.
     std::vector<Box> boxesList[5];
@@ -5058,6 +5055,117 @@ TEST_P(PixelLocalStorageTest, EGLRedefineBoundAttachmentsConflict)
     eglDestroyImageKHR(window->getDisplay(), image);
 }
 
+// Port of poc.html from b/580845687: beginning pixel local storage when a face of a
+// cube-incomplete cube map is attached to the draw framebuffer.
+TEST_P(PixelLocalStorageTest, IncompleteCubeMapAttachment)
+{
+    ANGLE_SKIP_TEST_IF(!EnsureGLExtensionEnabled("GL_ANGLE_shader_pixel_local_storage"));
+
+    constexpr GLsizei kOldSize = 2048;
+    constexpr GLsizei kNewSize = 1024;
+
+    // 1. Cube map: six kOldSize x kOldSize RGBA8 faces with data, sampled once so ANGLE
+    //    allocates and fills the kOldSize x kOldSize x 6 R8G8B8A8_UNORM VkImage (1 level).
+    GLTexture cube;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    const std::vector<GLColor> kOldData(kOldSize * kOldSize, GLColor::blue);
+    for (GLenum face = GL_TEXTURE_CUBE_MAP_POSITIVE_X; face <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+         ++face)
+    {
+        glTexImage2D(face, 0, GL_RGBA8, kOldSize, kOldSize, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     kOldData.data());
+    }
+
+    constexpr char kCubeSampleFS[] = R"(#version 300 es
+precision mediump float;
+uniform mediump samplerCube texCube;
+out vec4 my_FragColor;
+void main() {
+    my_FragColor = texture(texCube, vec3(0.0, 0.0, -1.0));
+})";
+    ANGLE_GL_PROGRAM(cubeProgram, essl3_shaders::vs::Simple(), kCubeSampleFS);
+    drawQuad(cubeProgram, essl3_shaders::PositionAttrib(), 0.0f);
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue);
+    ASSERT_GL_NO_ERROR();
+
+    // 2. Redefine ONLY the +X face: kNewSize x kNewSize RGB565.
+    const std::vector<GLushort> kNewData(kNewSize * kNewSize, 0xF800u);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGB565, kNewSize, kNewSize, 0, GL_RGB,
+                 GL_UNSIGNED_SHORT_5_6_5, kNewData.data());
+    ASSERT_GL_NO_ERROR();
+
+    // 3. Attach the -Z face (layer 5) to a user framebuffer.
+    GLFramebuffer fbo;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
+                           cube, 0);
+    EXPECT_GLENUM_EQ(GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
+                     glCheckFramebufferStatus(GL_FRAMEBUFFER));
+
+    // 4. A texture-backed PLS plane whose size matches the attachment's front-end size.
+    PLSTestTexture plane(GL_RGBA8, kOldSize, kOldSize);
+    glFramebufferTexturePixelLocalStorageANGLE(0, plane, 0, 0, GL_NONE);
+    glDisable(GL_DITHER);
+    ASSERT_GL_NO_ERROR();
+
+    // 5. beginPixelLocalStorageANGLE([GL_LOAD_OP_CLEAR_ANGLE]).
+    //    Because the draw framebuffer has an incomplete cube map attachment, beginning pixel local
+    //    storage must fail with GL_INVALID_FRAMEBUFFER_OPERATION.
+    glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_LOAD_OP_CLEAR_ANGLE}));
+    EXPECT_GL_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+    EXPECT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+
+    // 6. Complete the cube map again by redefining +X back to kOldSize x kOldSize RGBA8 and verify
+    //    that the framebuffer becomes complete, the -Z face preserved its contents, and pixel
+    //    local storage succeeds.
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGBA8, kOldSize, kOldSize, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, kOldData.data());
+    EXPECT_GLENUM_EQ(GL_FRAMEBUFFER_COMPLETE, glCheckFramebufferStatus(GL_FRAMEBUFFER));
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue);
+    glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_LOAD_OP_CLEAR_ANGLE}));
+    glEndPixelLocalStorageANGLE(1, GLenumArray({GL_STORE_OP_STORE_ANGLE}));
+    glFinish();
+    ASSERT_GL_NO_ERROR();
+
+    // 7. Also test redefining +X to a larger size than the allocated VkImage and attaching +X.
+    constexpr GLsizei kLargerSize = kOldSize * 2;
+    const std::vector<GLColor> kLargerData(kLargerSize * kLargerSize, GLColor::red);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGBA8, kLargerSize, kLargerSize, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, kLargerData.data());
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X,
+                           cube, 0);
+    EXPECT_GLENUM_EQ(GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
+                     glCheckFramebufferStatus(GL_FRAMEBUFFER));
+
+    PLSTestTexture largerPlane(GL_RGBA8, kLargerSize, kLargerSize);
+    glFramebufferTexturePixelLocalStorageANGLE(0, largerPlane, 0, 0, GL_NONE);
+    glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_LOAD_OP_CLEAR_ANGLE}));
+    EXPECT_GL_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+    EXPECT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+
+    // 8. Also test an incomplete cube map whose VkImage has never been allocated (only -Z defined,
+    //    +X undefined).
+    GLTexture unallocatedCube;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, unallocatedCube);
+    glTexImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, 0, GL_RGBA8, kNewSize, kNewSize, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, kOldData.data());
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
+                           unallocatedCube, 0);
+    EXPECT_GLENUM_EQ(GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT,
+                     glCheckFramebufferStatus(GL_FRAMEBUFFER));
+
+    PLSTestTexture newSizePlane(GL_RGBA8, kNewSize, kNewSize);
+    glFramebufferTexturePixelLocalStorageANGLE(0, newSizePlane, 0, 0, GL_NONE);
+    glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_LOAD_OP_CLEAR_ANGLE}));
+    EXPECT_GL_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+    EXPECT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+}
+
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(PixelLocalStorageTest);
 #define PLATFORM(API, BACKEND) API##_##BACKEND()
 #define PLS_INSTANTIATE_RENDERING_TEST_AND(TEST, API, ...)                                \
@@ -5242,7 +5350,7 @@ TEST_P(PixelLocalStorageTestES31, EarlyFragmentTests)
         fragColor = vec4(1, 0, 0, 1);
     })";
 
-    ANGLE_GL_PROGRAM(drawGreen, kFullscreenVS, kDrawRed);
+    ANGLE_GL_PROGRAM(drawRed, kFullscreenVS, kDrawRed);
 
     // Render to stencil without PLS uniforms and with a discard. Since we discard, and since the
     // shader shouldn't enable early_fragment_tests, stencil should not be affected.
@@ -5268,7 +5376,7 @@ TEST_P(PixelLocalStorageTestES31, EarlyFragmentTests)
 
     // Render red to the framebuffer with a stencil test. This should have no effect because the
     // stencil buffer should be all zeros.
-    glUseProgram(drawGreen);
+    glUseProgram(drawRed);
     glStencilFunc(GL_NOTEQUAL, 0, ~0u);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     EXPECT_PIXEL_RECT_EQ(0, 0, W, H, GLColor::green);
@@ -5288,7 +5396,7 @@ TEST_P(PixelLocalStorageTestES31, EarlyFragmentTests)
 
     // Render red to the framebuffer again. This time the stencil test should pass because the
     // stencil buffer should be all ones.
-    glUseProgram(drawGreen);
+    glUseProgram(drawRed);
     glStencilFunc(GL_NOTEQUAL, 0, ~0u);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     EXPECT_PIXEL_RECT_EQ(0, 0, W, H, GLColor::red);
@@ -6033,13 +6141,12 @@ TEST_P(PixelLocalStorageValidationTest, glFramebufferPixelLocalClearValuesANGLE)
 #define EXPECT_BANNED_DEFAULT_MSG(cmd) \
     EXPECT_BANNED(cmd, "Operation not permitted while pixel local storage is active.")
 
-static std::vector<char> FormatBannedCapMsg(GLenum cap)
+static std::string FormatBannedCapMsg(GLenum cap)
 {
-    constexpr char format[] =
-        "Cap 0x%04X cannot be enabled or disabled while pixel local storage is active.";
-    std::vector<char> msg(ANGLE_UNSAFE_TODO(std::snprintf(nullptr, 0, format, cap) + 1));
-    ANGLE_UNSAFE_TODO(std::snprintf(msg.data(), msg.size(), format, cap));
-    return msg;
+    std::ostringstream msg;
+    msg << "Cap 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << cap
+        << " cannot be enabled or disabled while pixel local storage is active.";
+    return msg.str();
 }
 
 #define EXPECT_ALLOWED_CAP(cap) \
@@ -6052,19 +6159,19 @@ static std::vector<char> FormatBannedCapMsg(GLenum cap)
 
 #define EXPECT_BANNED_CAP(cap)                           \
     {                                                    \
-        std::vector<char> msg = FormatBannedCapMsg(cap); \
-        EXPECT_BANNED(glEnable(cap), msg.data());        \
-        EXPECT_BANNED(glDisable(cap), msg.data());       \
+        const std::string msg = FormatBannedCapMsg(cap); \
+        EXPECT_BANNED(glEnable(cap), msg.c_str());       \
+        EXPECT_BANNED(glDisable(cap), msg.c_str());      \
         glIsEnabled(cap);                                \
         EXPECT_GL_NO_ERROR();                            \
     }
 
-#define EXPECT_BANNED_CAP_INDEXED(cap)                    \
-    {                                                     \
-        std::vector<char> msg = FormatBannedCapMsg(cap);  \
-        EXPECT_BANNED(glEnableiOES(cap, 0), msg.data());  \
-        EXPECT_BANNED(glDisableiOES(cap, 0), msg.data()); \
-        EXPECT_GL_NO_ERROR();                             \
+#define EXPECT_BANNED_CAP_INDEXED(cap)                     \
+    {                                                      \
+        const std::string msg = FormatBannedCapMsg(cap);   \
+        EXPECT_BANNED(glEnableiOES(cap, 0), msg.c_str());  \
+        EXPECT_BANNED(glDisableiOES(cap, 0), msg.c_str()); \
+        EXPECT_GL_NO_ERROR();                              \
     }
 
 // Check that glBeginPixelLocalStorageANGLE validates non-PLS context state as specified.
@@ -6513,6 +6620,31 @@ TEST_P(PixelLocalStorageValidationTest, BeginPixelLocalStorageANGLE_framebuffer_
     EXPECT_GL_SINGLE_ERROR_MSG(
         "Planes must be less than or equal to GL_MAX_PIXEL_LOCAL_STORAGE_PLANES_ANGLE.");
     ASSERT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+
+    // INVALID_FRAMEBUFFER_OPERATION is generated if the draw framebuffer has any attachment, and
+    // CheckFramebufferStatus(DRAW_FRAMEBUFFER) is not FRAMEBUFFER_COMPLETE.
+    {
+        GLTexture incompleteTex;
+        glBindTexture(GL_TEXTURE_2D, incompleteTex);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, incompleteTex,
+                               0);
+        glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_DONT_CARE}));
+        EXPECT_GL_SINGLE_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+        EXPECT_GL_SINGLE_ERROR_MSG("Framebuffer is incomplete: Attachment has zero size.");
+        ASSERT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+
+        GLTexture incompleteCube;
+        glBindTexture(GL_TEXTURE_CUBE_MAP, incompleteCube);
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, 0, GL_RGBA8, 100, 100, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
+                               incompleteCube, 0);
+        glBeginPixelLocalStorageANGLE(1, GLenumArray({GL_DONT_CARE}));
+        EXPECT_GL_SINGLE_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+        EXPECT_GL_SINGLE_ERROR_MSG(
+            "Framebuffer is incomplete: Attachment is an incomplete cube map.");
+        ASSERT_GL_INTEGER(GL_PIXEL_LOCAL_STORAGE_ACTIVE_PLANES_ANGLE, 0);
+    }
 
     // INVALID_FRAMEBUFFER_OPERATION is generated if the draw framebuffer has an image attached to
     // any color attachment point on or after:

@@ -85,6 +85,7 @@ class GenMetalTraverser : public TIntermTraverser
                       IdGen &idGen,
                       const PipelineStructs &pipelineStructs,
                       SymbolEnv &symbolEnv,
+                      const ProgramPreludeConfig &ppc,
                       const ShCompileOptions &compileOptions);
 
     void visitSymbol(TIntermSymbol *) override;
@@ -138,6 +139,7 @@ class GenMetalTraverser : public TIntermTraverser
 
     void emitNameOf(const TField &object);
     void emitNameOf(const TSymbol &object);
+    void emitNameOf(const TVariable &object);
     void emitBlockNameOf(const TSymbol &object);
     void emitNameOf(const VarDecl &object);
 
@@ -189,6 +191,7 @@ class GenMetalTraverser : public TIntermTraverser
     const PipelineStructs &mPipelineStructs;
     SymbolEnv &mSymbolEnv;
     IdGen &mIdGen;
+    const ShCompileOptions &mCompileOptions;
     int mIndentLevel                  = -1;
     int mLastIndentationPos           = -1;
     int mOpenPointerParenCount        = 0;
@@ -203,6 +206,7 @@ class GenMetalTraverser : public TIntermTraverser
     size_t mDriverUniformsBindingIndex     = 0;
     size_t mUBOArgumentBufferBindingIndex  = 0;
     bool mRasterOrderGroupsSupported       = false;
+    bool mWriteHelperSampleMask            = false;
 };
 }  // anonymous namespace
 
@@ -218,6 +222,7 @@ GenMetalTraverser::GenMetalTraverser(const TCompiler &compiler,
                                      IdGen &idGen,
                                      const PipelineStructs &pipelineStructs,
                                      SymbolEnv &symbolEnv,
+                                     const ProgramPreludeConfig &ppc,
                                      const ShCompileOptions &compileOptions)
     : TIntermTraverser(true, false, false),
       mOut(out),
@@ -225,11 +230,13 @@ GenMetalTraverser::GenMetalTraverser(const TCompiler &compiler,
       mPipelineStructs(pipelineStructs),
       mSymbolEnv(symbolEnv),
       mIdGen(idGen),
+      mCompileOptions(compileOptions),
       mMainUniformBufferIndex(compileOptions.metal.defaultUniformsBindingIndex),
       mDriverUniformsBindingIndex(compileOptions.metal.driverUniformsBindingIndex),
       mUBOArgumentBufferBindingIndex(compileOptions.metal.UBOArgumentBufferBindingIndex),
       mRasterOrderGroupsSupported(compileOptions.pls.fragmentSyncType ==
-                                  ShFragmentSynchronizationType::RasterOrderGroups_Metal)
+                                  ShFragmentSynchronizationType::RasterOrderGroups_Metal),
+      mWriteHelperSampleMask(ppc.writeHelperSampleMask)
 {}
 
 void GenMetalTraverser::emitIndentation()
@@ -923,10 +930,27 @@ void GenMetalTraverser::emitNameOf(const TField &object)
 
 void GenMetalTraverser::emitNameOf(const TSymbol &object)
 {
+    ASSERT(mRenamedSymbols.find(&object) == mRenamedSymbols.end());
+    EmitName(mOut, Name(object), kUserVariableNamePrefix);
+}
+
+void GenMetalTraverser::emitNameOf(const TVariable &object)
+{
     auto it = mRenamedSymbols.find(&object);
     if (it == mRenamedSymbols.end())
     {
-        EmitName(mOut, Name(object), kUserVariableNamePrefix);
+        // If this is a private variable and we're not interested in retaining debug info, use a
+        // temp name.
+        if (!mCompileOptions.outputDebugInfo && object.symbolType() == SymbolType::UserDefined &&
+            IsPrivate(object.getType().getQualifier()))
+        {
+            EmitName(mOut, Name(object.getTempName(), SymbolType::AngleInternal),
+                     kUserVariableNamePrefix);
+        }
+        else
+        {
+            EmitName(mOut, Name(object), kUserVariableNamePrefix);
+        }
     }
     else
     {
@@ -1302,8 +1326,15 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
         case TQualifier::EvqSampleMask:
             if (field.symbolType() == SymbolType::AngleInternal)
             {
-                mOut << " [[sample_mask, function_constant("
-                     << sh::mtl::kSampleMaskWriteEnabledConstName << ")]]";
+                if (mWriteHelperSampleMask)
+                {
+                    mOut << " [[sample_mask]]";
+                }
+                else
+                {
+                    mOut << " [[sample_mask, function_constant("
+                         << sh::mtl::kSampleMaskWriteEnabledConstName << ")]]";
+                }
             }
             break;
 
@@ -2828,7 +2859,7 @@ bool sh::EmitMetal(TCompiler &compiler,
 #else
         TInfoSinkBase &outWrapper = out;
 #endif
-        GenMetalTraverser gen(compiler, outWrapper, idGen, pipelineStructs, symbolEnv,
+        GenMetalTraverser gen(compiler, outWrapper, idGen, pipelineStructs, symbolEnv, ppc,
                               compileOptions);
         root.traverse(&gen);
     }

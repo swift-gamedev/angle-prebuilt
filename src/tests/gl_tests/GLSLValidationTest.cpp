@@ -790,6 +790,37 @@ TEST_P(GLSLValidationTest, AssignFunctionCallToGlobal)
                   "'=' : global variable initializers must be constant expressions");
 }
 
+// Function call in global scope is not allowed
+TEST_P(GLSLValidationTest_ES3, AssignFunctionCallToGlobal)
+{
+    constexpr char kFS[] = R"(#version 300 es
+precision mediump float;
+vec4 f() { return vec4(0.0); }
+vec4 v = f();
+out vec4 color;
+void main() { color = v; }
+)";
+
+    validateError(GL_FRAGMENT_SHADER, kFS,
+                  "'=' : global variable initializers must be constant expressions");
+}
+
+// Function call in global scope is not allowed.  This test passes a sampler to the function.
+TEST_P(GLSLValidationTest_ES3, AssignFunctionCallToGlobalWithSamplerArg)
+{
+    constexpr char kFS[] = R"(#version 300 es
+precision mediump float;
+uniform sampler2D s;
+vec4 f(sampler2D s) { return vec4(0.0); }
+vec4 v = f(s);
+out vec4 color;
+void main() { color = v; }
+)";
+
+    validateError(GL_FRAGMENT_SHADER, kFS,
+                  "'=' : global variable initializers must be constant expressions");
+}
+
 // Global variable initializers need to be constant expressions (ESSL 1.00 section 4.3)
 // Initializing with an assignment to another global should be an error.
 TEST_P(GLSLValidationTest, AssignAssignmentToGlobal)
@@ -3269,6 +3300,91 @@ void main() {
                   "'s' : Size of declared variable exceeds implementation-defined limit");
 }
 
+class WebGL2GLSLValidationTest_LimitShaderVariableFields : public WebGL2GLSLValidationTest
+{};
+
+// Validate that uniform blocks with nested structs whose cumulative expanded field count exceeds
+// the per-shader limit are rejected when LimitShaderVariableFieldsAtCompileTime is enabled, while
+// those within the limit are accepted.
+TEST_P(WebGL2GLSLValidationTest_LimitShaderVariableFields,
+       NestedStructsInUniformBlocksExceedFieldLimit)
+{
+    ANGLE_SKIP_TEST_IF(
+        !getEGLWindow()->isFeatureEnabled(Feature::LimitShaderVariableFieldsAtCompileTime));
+
+    constexpr char kValidVS[] = R"(#version 300 es
+precision highp float;
+
+struct S0 {
+    float f0; float f1; float f2; float f3;
+    float f4; float f5; float f6; float f7;
+    float f8; float f9; float f10; float f11;
+    float f12; float f13; float f14; float f15;
+};
+
+struct S1 {
+    S0 f0; S0 f1; S0 f2; S0 f3;
+    S0 f4; S0 f5; S0 f6; S0 f7;
+    S0 f8; S0 f9; S0 f10; S0 f11;
+    S0 f12; S0 f13; S0 f14; S0 f15;
+};
+
+struct S2 {
+    S1 f0; S1 f1; S1 f2; S1 f3;
+    S1 f4; S1 f5; S1 f6; S1 f7;
+    S1 f8; S1 f9; S1 f10; S1 f11;
+    S1 f12; S1 f13; S1 f14; S1 f15;
+};
+
+layout(std140) uniform B0 { S2 g0; S2 g1; S2 g2; } b0;
+layout(std140) uniform B1 { S2 g3; S2 g4; S2 g5; } b1;
+out float linkedValue;
+
+void main() {
+    linkedValue = b0.g0.f0.f0.f0 + b1.g3.f0.f0.f0;
+    gl_Position = vec4(linkedValue, 0.0, 0.0, 1.0);
+})";
+
+    validateSuccess(GL_VERTEX_SHADER, kValidVS);
+
+    constexpr char kExcessiveVS[] = R"(#version 300 es
+precision highp float;
+
+struct S0 {
+    float f0; float f1; float f2; float f3;
+    float f4; float f5; float f6; float f7;
+    float f8; float f9; float f10; float f11;
+    float f12; float f13; float f14; float f15;
+};
+
+struct S1 {
+    S0 f0; S0 f1; S0 f2; S0 f3;
+    S0 f4; S0 f5; S0 f6; S0 f7;
+    S0 f8; S0 f9; S0 f10; S0 f11;
+    S0 f12; S0 f13; S0 f14; S0 f15;
+};
+
+struct S2 {
+    S1 f0; S1 f1; S1 f2; S1 f3;
+    S1 f4; S1 f5; S1 f6; S1 f7;
+    S1 f8; S1 f9; S1 f10; S1 f11;
+    S1 f12; S1 f13; S1 f14; S1 f15;
+};
+
+layout(std140) uniform B0 { S2 g0; S2 g1; S2 g2; } b0;
+layout(std140) uniform B1 { S2 g3; S2 g4; S2 g5; } b1;
+layout(std140) uniform B2 { S2 g6; S2 g7; S2 g8; } b2;
+out float linkedValue;
+
+void main() {
+    linkedValue = b0.g0.f0.f0.f0 + b1.g3.f0.f0.f0 + b2.g6.f0.f0.f0;
+    gl_Position = vec4(linkedValue, 0.0, 0.0, 1.0);
+})";
+
+    validateError(GL_VERTEX_SHADER, kExcessiveVS,
+                  "'B2' : Number of declared variable fields exceeds implementation-defined limit");
+}
+
 // Test that too large color outputs are rejected
 TEST_P(WebGL2GLSLValidationTest, LargeColorOutput)
 {
@@ -3741,6 +3857,61 @@ void main()
 
     validateError(GL_GEOMETRY_SHADER, kGS,
                   "'gl_Position' : redefinition in an invalid interface block");
+}
+
+// Negative test redefining gl_PerVertex with a member that is not one of its built-ins
+TEST_P(GLSLValidationTest_ES31, RedefinePerVertexWithInvalidMember)
+{
+    constexpr char kExpect[] = "'foo' : invalid member of gl_PerVertex";
+
+    if (IsGLExtensionEnabled("GL_EXT_geometry_shader"))
+    {
+        constexpr char kGS[] = R"(#version 310 es
+#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float foo;
+};
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    EmitVertex();
+    EndPrimitive();
+})";
+        validateError(GL_GEOMETRY_SHADER, kGS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_tessellation_shader"))
+    {
+        constexpr char kTCS[] = R"(#version 310 es
+#extension GL_EXT_tessellation_shader : require
+layout (vertices = 3) out;
+out gl_PerVertex
+{
+    highp vec4 gl_Position;
+    highp float foo;
+} gl_out[];
+void main()
+{
+    gl_out[gl_InvocationID].gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+})";
+        validateError(GL_TESS_CONTROL_SHADER, kTCS, kExpect);
+    }
+}
+
+// Negative test declaring gl_PerVertex in a compute shader, where it is a reserved name
+TEST_P(GLSLValidationTest_ES31, ComputeDeclarePerVertex)
+{
+    constexpr char kCS[] = R"(#version 310 es
+layout(local_size_x = 1) in;
+buffer gl_PerVertex {
+    highp float x;
+};
+void main() {})";
+
+    validateError(GL_COMPUTE_SHADER, kCS, "'gl_PerVertex' : reserved built-in name");
 }
 
 // Regression test case of unary + constant folding of a void struct member.
@@ -4699,6 +4870,44 @@ void main()
     color = global3;
 })";
     validateSuccess(GL_VERTEX_SHADER, kVS);
+}
+
+// Test that initializing global variables with function call works
+TEST_P(GLSLValidationTest_ES3, InitGlobalFunctionCall)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_non_constant_global_initializers"));
+
+    constexpr char kVS[] = R"(#version 300 es
+#extension GL_EXT_shader_non_constant_global_initializers : require
+uniform vec4 u;
+out vec4 color;
+vec4 f() { return vec4(0); }
+vec4 global = f();
+void main()
+{
+    color = global;
+})";
+    validateSuccess(GL_VERTEX_SHADER, kVS);
+}
+
+// Function call in global scope is not allowed if passed a sampler
+TEST_P(GLSLValidationTest_ES3, InitGlobalFunctionCallWithSamplerParam)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_non_constant_global_initializers"));
+
+    constexpr char kVS[] = R"(#version 300 es
+#extension GL_EXT_shader_non_constant_global_initializers : require
+uniform vec4 u;
+out vec4 color;
+uniform sampler2D s;
+vec4 f(sampler2D s) { return vec4(0.0); }
+vec4 global = f(s);
+void main()
+{
+    color = global;
+})";
+    validateError(GL_VERTEX_SHADER, kVS,
+                  "passing samplers to functions at global scope is currently unsupported");
 }
 
 // Regression test for a crash in SPIR-V output when faced with an array of struct constant.
@@ -6807,6 +7016,16 @@ class GLSLValidationClipDistanceTest_ES31 : public GLSLValidationTest_ES31
             << shaderSource;
         validateError(shaderType, src.str().c_str(), expectedError);
     }
+
+    void validateSuccessWithExt(GLenum shaderType, const char *extension, const char *shaderSource)
+    {
+        std::stringstream src;
+        src << R"(#version 310 es
+#extension )"
+            << extension << ": require\n"
+            << shaderSource;
+        validateSuccess(shaderType, src.str().c_str());
+    }
 };
 
 // Extension support is required to compile properly.  Expect failure when it is not present.
@@ -7223,6 +7442,83 @@ void main()
     if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
     {
         validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFS, kExpect);
+    }
+}
+
+// In fragment shader, redeclaring gl_ClipDistance as a non-array should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES3, FragmentClipDistanceTypes)
+{
+    constexpr char kFSVec2[]  = R"(out highp vec4 fragColor;
+
+in highp vec2 gl_ClipDistance;
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kFSFloat[] = R"(out highp vec4 fragColor;
+
+in highp float gl_ClipDistance;
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kExpect[] =
+        "'gl_ClipDistance' : redeclaration of built-in with a different type";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFSVec2, kExpect);
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFSFloat, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFSVec2, kExpect);
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFSFloat, kExpect);
+    }
+}
+
+// In fragment shader, redeclaring gl_CullDistance as a non-array should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES3, FragmentCullDistanceTypes)
+{
+    constexpr char kFSVec2[]  = R"(out highp vec4 fragColor;
+
+in highp vec2 gl_CullDistance;
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kFSFloat[] = R"(out highp vec4 fragColor;
+
+in highp float gl_CullDistance;
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kExpect[] =
+        "'gl_CullDistance' : redeclaration of built-in with a different type";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        GLint maxCullDistances = 0;
+        glGetIntegerv(GL_MAX_CULL_DISTANCES_EXT, &maxCullDistances);
+        if (maxCullDistances > 0)
+        {
+            validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFSVec2,
+                                 kExpect);
+            validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFSFloat,
+                                 kExpect);
+        }
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFSVec2, kExpect);
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFSFloat, kExpect);
     }
 }
 
@@ -7976,6 +8272,215 @@ void main()
     }
 }
 
+// In geometry shader, redeclaring gl_PerVertex with gl_Position as an array should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexPositionArray)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[]     = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp float gl_Position[4];
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] = "'gl_Position' : redeclaration of built-in with a different type";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS, kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_PerVertex with gl_ClipDistance as a non-array or as an array
+// of arrays should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexClipDistanceTypes)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGSVec2[]          = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp vec2 gl_ClipDistance;
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kGSFloat[]         = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp float gl_ClipDistance;
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kGSArrayOfArrays[] = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp float gl_ClipDistance[2][3];
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] =
+        "'gl_ClipDistance' : redeclaration of built-in with a different type";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGSVec2, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGSFloat, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGSArrayOfArrays,
+                             kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSVec2, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSFloat, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSArrayOfArrays,
+                             kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_PerVertex with gl_CullDistance as a non-array or as an array
+// of arrays should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexCullDistanceTypes)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGSVec2[]          = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp vec2 gl_CullDistance;
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kGSFloat[]         = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp float gl_CullDistance;
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kGSArrayOfArrays[] = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp float gl_CullDistance[2][3];
+} gl_in[];
+void main()
+{
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] =
+        "'gl_CullDistance' : redeclaration of built-in with a different type";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        GLint maxCullDistances = 0;
+        glGetIntegerv(GL_MAX_CULL_DISTANCES_EXT, &maxCullDistances);
+        if (maxCullDistances > 0)
+        {
+            validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGSVec2,
+                                 kExpect);
+            validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGSFloat,
+                                 kExpect);
+            validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance",
+                                 kGSArrayOfArrays, kExpect);
+        }
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSVec2, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSFloat, kExpect);
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGSArrayOfArrays,
+                             kExpect);
+    }
+}
+
+// In fragment shader, redeclaring gl_ClipDistance as an array of arrays should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES31, FragmentClipDistanceArrayOfArrays)
+{
+    constexpr char kFS[] = R"(out highp vec4 fragColor;
+
+in highp float gl_ClipDistance[2][3];
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kExpect[] =
+        "'gl_ClipDistance' : redeclaration of built-in as an array of arrays";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFS, kExpect);
+    }
+}
+
+// In fragment shader, redeclaring gl_CullDistance as an array of arrays should be denied
+TEST_P(GLSLValidationClipDistanceTest_ES31, FragmentCullDistanceArrayOfArrays)
+{
+    constexpr char kFS[] = R"(out highp vec4 fragColor;
+
+in highp float gl_CullDistance[2][3];
+
+void main()
+{
+    fragColor = vec4(1, 0, 0, 1);
+})";
+    constexpr char kExpect[] =
+        "'gl_CullDistance' : redeclaration of built-in as an array of arrays";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        GLint maxCullDistances = 0;
+        glGetIntegerv(GL_MAX_CULL_DISTANCES_EXT, &maxCullDistances);
+        if (maxCullDistances > 0)
+        {
+            validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_ANGLE_clip_cull_distance", kFS, kExpect);
+        }
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_FRAGMENT_SHADER, "GL_EXT_clip_cull_distance", kFS, kExpect);
+    }
+}
+
 // In compute shader, redeclaring gl_ClipDistance should be denied.
 TEST_P(GLSLValidationClipDistanceTest_ES31, ComputeDeclareClipDistance)
 {
@@ -8083,6 +8588,362 @@ void main() { highp float c = gl_CullDistance[0]; })";
     if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
     {
         validateErrorWithExt(GL_COMPUTE_SHADER, "GL_EXT_clip_cull_distance", kCS, kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_ClipDistance both in the output gl_PerVertex block and as a
+// global variable with the same size should be denied.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexDuplicateOutClipDistance)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[]     = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[4];
+};
+out highp float gl_ClipDistance[4];
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_ClipDistance[0] = 1.0;
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] = "'gl_ClipDistance' : redefinition";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS, kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_ClipDistance both in the output gl_PerVertex block and as a
+// global variable with a different size should be denied.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexMismatchedOutClipDistance)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[]     = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[4];
+};
+out highp float gl_ClipDistance[2];
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_ClipDistance[0] = 1.0;
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] = "'gl_ClipDistance' : redefinition";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS, kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_ClipDistance in the gl_PerVertex block with a size greater
+// than gl_MaxClipDistances should be denied.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexClipDistanceTooLarge)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[]     = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[gl_MaxClipDistances + 1];
+};
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_ClipDistance[0] = 1.0;
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] = "redeclaration of gl_ClipDistance with size > gl_MaxClipDistances";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS, kExpect);
+    }
+}
+
+// In geometry shader, redeclaring gl_CullDistance in the gl_PerVertex block with a size greater
+// than gl_MaxCullDistances should be denied.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexCullDistanceTooLarge)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[]     = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_CullDistance[gl_MaxCullDistances + 1];
+};
+void main()
+{
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_CullDistance[0] = 1.0;
+    EmitVertex();
+    EndPrimitive();
+})";
+    constexpr char kExpect[] = "redeclaration of gl_CullDistance with size > gl_MaxCullDistances";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        GLint maxCullDistances = 0;
+        glGetIntegerv(GL_MAX_CULL_DISTANCES_EXT, &maxCullDistances);
+        if (maxCullDistances > 0)
+        {
+            validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS, kExpect);
+        }
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS, kExpect);
+    }
+}
+
+// In tessellation control shader, redeclaring gl_ClipDistance in the gl_PerVertex block with a size
+// greater than gl_MaxClipDistances should be denied.
+TEST_P(GLSLValidationClipDistanceTest_ES31, TessControlPerVertexClipDistanceTooLarge)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_tessellation_shader"));
+
+    constexpr char kTCS[]    = R"(#extension GL_EXT_tessellation_shader : require
+layout (vertices = 3) out;
+out gl_PerVertex
+{
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[gl_MaxClipDistances + 1];
+} gl_out[];
+void main()
+{
+    gl_out[gl_InvocationID].gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    gl_out[gl_InvocationID].gl_ClipDistance[0] = 1.0;
+})";
+    constexpr char kExpect[] = "redeclaration of gl_ClipDistance with size > gl_MaxClipDistances";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_TESS_CONTROL_SHADER, "GL_ANGLE_clip_cull_distance", kTCS, kExpect);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateErrorWithExt(GL_TESS_CONTROL_SHADER, "GL_EXT_clip_cull_distance", kTCS, kExpect);
+    }
+}
+
+// In geometry shader, gl_in[].gl_ClipDistance and the output gl_ClipDistance are different
+// variables, so they can be redeclared with different sizes.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexInOutClipDistanceDifferentSize)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kGS[] = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[4];
+} gl_in[];
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[2];
+};
+void main()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        gl_Position = gl_in[i].gl_Position * gl_in[i].gl_ClipDistance[3];
+        EmitVertex();
+    }
+    EndPrimitive();
+})";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateSuccessWithExt(GL_GEOMETRY_SHADER, "GL_ANGLE_clip_cull_distance", kGS);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateSuccessWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", kGS);
+    }
+}
+
+// In tessellation control shader, gl_in[].gl_ClipDistance and gl_out[].gl_ClipDistance can be
+// redeclared with different sizes.
+TEST_P(GLSLValidationClipDistanceTest_ES31, TessControlPerVertexInOutClipDistanceDifferentSize)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_tessellation_shader"));
+
+    constexpr char kTCS[] = R"(#extension GL_EXT_tessellation_shader : require
+layout (vertices = 3) out;
+in gl_PerVertex
+{
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[4];
+} gl_in[gl_MaxPatchVertices];
+out gl_PerVertex
+{
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[2];
+} gl_out[];
+void main()
+{
+    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
+    gl_out[gl_InvocationID].gl_ClipDistance[0] = gl_in[gl_InvocationID].gl_ClipDistance[0];
+    gl_out[gl_InvocationID].gl_ClipDistance[1] = gl_in[gl_InvocationID].gl_ClipDistance[3];
+    gl_TessLevelInner[0] = 1.0;
+    gl_TessLevelOuter[0] = 1.0;
+    gl_TessLevelOuter[1] = 1.0;
+    gl_TessLevelOuter[2] = 1.0;
+})";
+
+    if (IsGLExtensionEnabled("GL_ANGLE_clip_cull_distance"))
+    {
+        validateSuccessWithExt(GL_TESS_CONTROL_SHADER, "GL_ANGLE_clip_cull_distance", kTCS);
+    }
+
+    if (IsGLExtensionEnabled("GL_EXT_clip_cull_distance"))
+    {
+        validateSuccessWithExt(GL_TESS_CONTROL_SHADER, "GL_EXT_clip_cull_distance", kTCS);
+    }
+}
+
+// In geometry shader, the sum of the sizes of gl_in[].gl_ClipDistance and gl_in[].gl_CullDistance
+// is limited by gl_MaxCombinedClipAndCullDistances.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexInputClipCullDistanceTooLarge)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_clip_cull_distance"));
+
+    GLint maxClipDistances = 0;
+    GLint maxCullDistances = 0;
+    GLint maxCombined      = 0;
+    glGetIntegerv(GL_MAX_CLIP_DISTANCES_EXT, &maxClipDistances);
+    glGetIntegerv(GL_MAX_CULL_DISTANCES_EXT, &maxCullDistances);
+    glGetIntegerv(GL_MAX_COMBINED_CLIP_AND_CULL_DISTANCES_EXT, &maxCombined);
+    ANGLE_SKIP_TEST_IF(maxClipDistances + maxCullDistances <= maxCombined);
+
+    // Each array is within its own limit, but their sum exceeds the combined limit.
+    std::stringstream gs;
+    gs << R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[)"
+       << maxClipDistances << R"(];
+    highp float gl_CullDistance[)"
+       << (maxCombined - maxClipDistances + 1) << R"(];
+} gl_in[];
+void main()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        gl_Position = gl_in[i].gl_Position * gl_in[i].gl_ClipDistance[0] *
+                      gl_in[i].gl_CullDistance[0];
+        EmitVertex();
+    }
+    EndPrimitive();
+})";
+    constexpr char kExpect[] =
+        "The sum of 'gl_ClipDistance' and 'gl_CullDistance' size is greater than "
+        "gl_MaxCombinedClipAndCullDistances";
+
+    validateErrorWithExt(GL_GEOMETRY_SHADER, "GL_EXT_clip_cull_distance", gs.str().c_str(),
+                         kExpect);
+}
+
+// gl_in[].gl_ClipDistance of a geometry shader is matched against gl_ClipDistance of the vertex
+// shader, and the output gl_ClipDistance of the geometry shader against that of the fragment
+// shader.
+TEST_P(GLSLValidationClipDistanceTest_ES31, GeometryPerVertexInOutClipDistanceDifferentSizeLink)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
+
+    constexpr char kVS[] = R"(
+in vec4 a_position;
+out highp float gl_ClipDistance[4];
+void main()
+{
+    gl_Position = a_position;
+    gl_ClipDistance[3] = 1.0;
+})";
+
+    constexpr char kGS[] = R"(#extension GL_EXT_geometry_shader : require
+layout (triangles) in;
+layout (triangle_strip, max_vertices = 3) out;
+in gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[4];
+} gl_in[];
+out gl_PerVertex {
+    highp vec4 gl_Position;
+    highp float gl_ClipDistance[2];
+};
+void main()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        gl_Position = gl_in[i].gl_Position * gl_in[i].gl_ClipDistance[3];
+        EmitVertex();
+    }
+    EndPrimitive();
+})";
+
+    constexpr char kFS[] = R"(
+precision highp float;
+in highp float gl_ClipDistance[2];
+out vec4 color;
+void main()
+{
+    color = vec4(gl_ClipDistance[1], 0.0, 0.0, 1.0);
+})";
+
+    for (const char *extension : {"GL_ANGLE_clip_cull_distance", "GL_EXT_clip_cull_distance"})
+    {
+        if (!IsGLExtensionEnabled(extension))
+        {
+            continue;
+        }
+
+        std::stringstream header;
+        header << "#version 310 es\n#extension " << extension << ": require\n";
+        EXPECT_TRUE(compile(GL_VERTEX_SHADER, (header.str() + kVS).c_str()).success());
+        EXPECT_TRUE(compile(GL_GEOMETRY_SHADER, (header.str() + kGS).c_str()).success());
+        EXPECT_TRUE(compile(GL_FRAGMENT_SHADER, (header.str() + kFS).c_str()).success());
+        link();
+        reset();
     }
 }
 
@@ -10385,16 +11246,15 @@ void main() { big[0][0] = 1.0; col = vec4(big[0][0]); })";
     validateError(GL_FRAGMENT_SHADER, kFS, "version");
 }
 
-class GLSLValidationTest_ES3_LimitOutputVaryings : public GLSLValidationTest_ES3
+class GLSLValidationTest_ES3_LimitVaryings : public GLSLValidationTest_ES3
 {};
 
 // Regression test for crbug.com/529991907.
 // Verify that compiling a shader with up to 256 output varying components
 // succeeds, and exceeding 256 components is rejected at compile time.
-TEST_P(GLSLValidationTest_ES3_LimitOutputVaryings, TooManyDeclaredVertexOutputComponents)
+TEST_P(GLSLValidationTest_ES3_LimitVaryings, TooManyDeclaredVertexOutputComponents)
 {
-    ANGLE_SKIP_TEST_IF(
-        !getEGLWindow()->isFeatureEnabled(Feature::LimitOutputVaryingsTo256AtCompileTime));
+    ANGLE_SKIP_TEST_IF(!getEGLWindow()->isFeatureEnabled(Feature::LimitVaryingsAtCompileTime));
 
     constexpr int kMaxVectors = 256 / 4;
 
@@ -10416,6 +11276,59 @@ TEST_P(GLSLValidationTest_ES3_LimitOutputVaryings, TooManyDeclaredVertexOutputCo
     vsInvalid << "void main() { gl_Position = vec4(0.0); }\n";
     validateError(GL_VERTEX_SHADER, vsInvalid.str().c_str(),
                   "Too many declared shader output varying components for this device");
+}
+
+// Regression test for crbug.com/569367111.
+// Verify that compiling a fragment shader with up to 256 input varying
+// components succeeds, and exceeding 256 components is rejected at compile
+// time.
+TEST_P(GLSLValidationTest_ES3_LimitVaryings, TooManyDeclaredFragmentInputComponents)
+{
+    ANGLE_SKIP_TEST_IF(!getEGLWindow()->isFeatureEnabled(Feature::LimitVaryingsAtCompileTime));
+
+    constexpr int kMaxVectors = 256 / 4;
+
+    std::stringstream fsValid;
+    fsValid << "#version 300 es\n";
+    fsValid << "precision highp float;\n";
+    for (int i = 0; i < kMaxVectors; ++i)
+    {
+        fsValid << "in highp vec4 v" << i << ";\n";
+    }
+    fsValid << "out highp vec4 fragColor;\n";
+    fsValid << "void main() { fragColor = vec4(0.0); }\n";
+    validateSuccess(GL_FRAGMENT_SHADER, fsValid.str().c_str());
+
+    std::stringstream fsInvalid;
+    fsInvalid << "#version 300 es\n";
+    fsInvalid << "precision highp float;\n";
+    for (int i = 0; i < kMaxVectors + 1; ++i)
+    {
+        fsInvalid << "in highp vec4 v" << i << ";\n";
+    }
+    fsInvalid << "out highp vec4 fragColor;\n";
+    fsInvalid << "void main() { fragColor = vec4(0.0); }\n";
+    validateError(GL_FRAGMENT_SHADER, fsInvalid.str().c_str(),
+                  "Too many declared shader input varying components for this device");
+
+    // Also verify that large active input arrays (as in crbug.com/569367111)
+    // exceeding 256 components are rejected at compile time.
+    constexpr char kLargeArraysFS[] = R"(#version 300 es
+precision mediump float;
+in mediump vec4 a0[4095];
+in mediump vec4 a1[4095];
+in mediump vec4 a2[4095];
+in mediump vec4 a3[4095];
+in mediump vec4 a4[909];
+flat in mediump vec4 a5;
+in mediump vec4 a6;
+layout(location = 0) out mediump vec4 color;
+void main() {
+    int i = int(gl_FragCoord.x) % 4095;
+    color = a0[i] + a1[i] + a2[i] + a3[i] + a4[i % 909] + a5 + a6;
+})";
+    validateError(GL_FRAGMENT_SHADER, kLargeArraysFS,
+                  "Too many declared shader input varying components for this device");
 }
 
 class GLSLValidationTest_ES2_PixelLocalStorage : public GLSLValidationTest_ES3
@@ -11363,10 +12276,15 @@ ANGLE_INSTANTIATE_TEST_ES2(WebGLGLSLValidationTest);
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(WebGL2GLSLValidationTest);
 ANGLE_INSTANTIATE_TEST_ES3(WebGL2GLSLValidationTest);
 
-GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(GLSLValidationTest_ES3_LimitOutputVaryings);
-ANGLE_INSTANTIATE_TEST(GLSLValidationTest_ES3_LimitOutputVaryings,
-                       ES3_OPENGL().enable(Feature::LimitOutputVaryingsTo256AtCompileTime),
-                       ES3_OPENGLES().enable(Feature::LimitOutputVaryingsTo256AtCompileTime));
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(GLSLValidationTest_ES3_LimitVaryings);
+ANGLE_INSTANTIATE_TEST(GLSLValidationTest_ES3_LimitVaryings,
+                       ES3_OPENGL().enable(Feature::LimitVaryingsAtCompileTime),
+                       ES3_OPENGLES().enable(Feature::LimitVaryingsAtCompileTime));
+
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(WebGL2GLSLValidationTest_LimitShaderVariableFields);
+ANGLE_INSTANTIATE_TEST(WebGL2GLSLValidationTest_LimitShaderVariableFields,
+                       ES3_OPENGL().enable(Feature::LimitShaderVariableFieldsAtCompileTime),
+                       ES3_OPENGLES().enable(Feature::LimitShaderVariableFieldsAtCompileTime));
 
 ANGLE_INSTANTIATE_TEST_ES2_AND(WebGLGLSLValidationExtensionDisableTest,
                                ES2_OPENGL().enable(Feature::AllowExtensionDisableAfterNonPpTokens));
@@ -11416,9 +12334,7 @@ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(GLSLValidationExtensionDirectiveTe
 ANGLE_INSTANTIATE_TEST_ES31(GLSLValidationExtensionDirectiveTest_ES31);
 
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(GLSLValidationExtensionDirectiveTestClipCull_ES31);
-ANGLE_INSTANTIATE_TEST(GLSLValidationExtensionDirectiveTestClipCull_ES31,
-                       ES31_VULKAN(),
-                       ES31_VULKAN_SWIFTSHADER());
+ANGLE_INSTANTIATE_TEST_ES31(GLSLValidationExtensionDirectiveTestClipCull_ES31);
 
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(GLSLValidationMultiviewTest_ES3);
 ANGLE_INSTANTIATE_TEST_ES3(GLSLValidationMultiviewTest_ES3);
